@@ -1,0 +1,68 @@
+rules:
+  - id: aegis-sql-injection-fstring
+    pattern: |
+      cursor.execute(f"...")
+    message: |
+      SQL Injection via f-string. User-controlled data is interpolated into a SQL query using f-strings.
+      Use parameterized queries instead.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: [CWE-89]
+      owasp: [A03:2021]
+      category: security
+      
+  - id: aegis-sql-injection-format-string
+    pattern: |
+      cursor.execute("..." % ...)
+    message: |
+      SQL Injection via string formatting. User-controlled data is interpolated into a SQL query using %-formatting.
+      Use parameterized queries instead.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: [CWE-89]
+      owasp: [A03:2021]
+      
+  - id: aegis-sql-injection-concat
+    pattern: |
+      cursor.execute("..." + ...)
+    message: |
+      SQL Injection via string concatenation. User-controlled data is concatenated into a SQL query.
+      Use parameterized queries instead.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      cwe: [CWE-89]
+      owasp: [A03:2021]
+      
+  - id: aegis-weak-hash-md5
+    pattern: |
+      hashlib.md5(...)
+    message: |
+      MD5 is cryptographically broken. Use SHA-256 or stronger for security purposes.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: [CWE-327]
+      
+  - id: aegis-os-command-injection
+    pattern-either:
+      - pattern: os.system($ARG)
+      - pattern: subprocess.call(..., shell=True)
+    message: |
+      Potential OS command injection. Use subprocess with shell=False and proper input validation.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      cwe: [CWE-78]
+      owasp: [A03:2021]
+      
+  - id: aegis-hardcoded-secret
+    pattern-regex: "(api_key|secret|password|token)\\s*=\\s*['\"][^'\"]{10,}['\"]"
+    message: |
+      Hardcoded secret detected. Use environment variables or secure secret management.
+    severity: ERROR
+    languages: [python, javascript, typescript]
+    metadata:
+      cwe: [CWE-798]
