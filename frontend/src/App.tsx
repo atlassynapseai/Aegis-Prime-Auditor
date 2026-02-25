@@ -1,436 +1,557 @@
-import { useState, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import './App.css'
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// TYPES
-// ═══════════════════════════════════════════════════════════════════════════════
-
 interface Finding {
-  id: string
-  engine: string
-  category: string
-  severity: string
-  message: string
-  file: string
-  line_start: number
-  snippet?: string
-  cwe?: string | string[]
+  id: string; engine: string; category: string; severity: string; message: string
+  file: string; line_start: number; snippet?: string; cwe?: string | string[]
+  package?: string; cve?: string
 }
 
 interface ScanResult {
-  scan_id: string
-  timestamp: string
-  file: string
-  total_findings: number
-  ai_analysis: {
-    executive_summary: string
-    risk_score: number
-    risk_level: string
-    top_priorities: string[]
-  }
-  heatmap_data: Array<{
-    category: string
-    severity: string
-    count: number
-    risk_weight: number
-    normalized: number
-  }>
+  scan_id: string; timestamp: string; file: string; total_findings: number
+  ai_analysis: { executive_summary: string; risk_score: number; risk_level: string; top_priorities?: string[] }
+  heatmap_data: Array<{ category: string; severity: string; count: number; normalized: number }>
   all_findings: Finding[]
   severity_breakdown: Record<string, number>
+  engines: any
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// COMPONENTS
-// ═══════════════════════════════════════════════════════════════════════════════
+interface ComplianceData {
+  frameworks: Record<string, any>
+  overall_status: {
+    recommendation: string
+    critical_blockers: number
+    estimated_remediation_time: string
+  }
+}
 
 function App() {
   const [file, setFile] = useState<File | null>(null)
   const [scanning, setScanning] = useState(false)
   const [result, setResult] = useState<ScanResult | null>(null)
+  const [compliance, setCompliance] = useState<ComplianceData | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
-  const [selectedSeverity, setSelectedSeverity] = useState<string | null>(null)
+  const [selectedCat, setSelectedCat] = useState<string | null>(null)
+  const [selectedSev, setSelectedSev] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const [history, setHistory] = useState<ScanResult[]>([])
+  const [showHistory, setShowHistory] = useState(false)
+  const [showCompliance, setShowCompliance] = useState(false)
+  const [toast, setToast] = useState<{msg: string; type: 'success'|'error'} | null>(null)
 
-  // Get backend URL from environment or use localhost
-  const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
+  const BACKEND = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0])
-      setError(null)
+  useEffect(() => {
+    const saved = localStorage.getItem('atlas_history')
+    if (saved) try { setHistory(JSON.parse(saved)) } catch {}
+  }, [])
+
+  useEffect(() => {
+    if (result && !history.find(s => s.scan_id === result.scan_id)) {
+      const updated = [result, ...history].slice(0, 20)
+      setHistory(updated)
+      localStorage.setItem('atlas_history', JSON.stringify(updated))
     }
+  }, [result])
+
+  const showToast = (msg: string, type: 'success'|'error') => {
+    setToast({ msg, type })
+    setTimeout(() => setToast(null), 4000)
+  }
+
+  const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0]
+    if (!f) return
+    
+    const ext = f.name.substring(f.name.lastIndexOf('.'))
+    if (!['.py','.js','.ts','.java','.go','.rb','.zip'].includes(ext)) {
+      setError('Invalid file type')
+      return
+    }
+    setFile(f)
+    setError(null)
+    showToast(`Selected: ${f.name}`, 'success')
   }
 
   const handleScan = async () => {
-    if (!file) {
-      setError('Please select a file to scan')
-      return
-    }
-
+    if (!file) return
+    
     setScanning(true)
     setError(null)
     setResult(null)
-
+    setCompliance(null)
+    
     try {
-      const formData = new FormData()
-      formData.append('file', file)
-
-      const response = await fetch(`${BACKEND_URL}/api/scan`, {
-        method: 'POST',
-        body: formData
-      })
-
-      if (!response.ok) {
-        throw new Error(`Scan failed: ${response.statusText}`)
-      }
-
-      const data = await response.json()
+      const fd = new FormData()
+      fd.append('file', file)
+      
+      const resp = await fetch(`${BACKEND}/api/scan`, { method: 'POST', body: fd })
+      if (!resp.ok) throw new Error(`Scan failed: ${resp.statusText}`)
+      
+      const data = await resp.json()
       setResult(data)
+      
+      // Fetch compliance data
+      const compResp = await fetch(`${BACKEND}/api/scan/${data.scan_id}/compliance`)
+      if (compResp.ok) {
+        setCompliance(await compResp.json())
+      }
+      
+      showToast(`Scan complete: ${data.total_findings} findings`, 'success')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Scan failed')
+      const msg = err instanceof Error ? err.message : 'Scan failed'
+      setError(msg)
+      showToast(msg, 'error')
     } finally {
       setScanning(false)
     }
   }
 
-  const getRiskColor = (level: string) => {
-    switch (level) {
-      case 'CRITICAL': return 'rgb(220, 38, 38)'
-      case 'HIGH': return 'rgb(234, 88, 12)'
-      case 'MEDIUM': return 'rgb(234, 179, 8)'
-      case 'LOW': return 'rgb(34, 197, 94)'
-      default: return 'rgb(100, 116, 139)'
+  const exportJSON = () => {
+    if (!result) return
+    const blob = new Blob([JSON.stringify(result, null, 2)], {type: 'application/json'})
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `atlas-scan-${result.scan_id}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    showToast('Exported JSON', 'success')
+  }
+
+  const exportSBOM = async () => {
+    if (!result) return
+    try {
+      const resp = await fetch(`${BACKEND}/api/scan/${result.scan_id}/sbom`)
+      const sbom = await resp.json()
+      const blob = new Blob([JSON.stringify(sbom, null, 2)], {type: 'application/json'})
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `atlas-sbom-${result.scan_id}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      showToast('Exported SBOM (CycloneDX)', 'success')
+    } catch (err) {
+      showToast('SBOM export failed', 'error')
     }
   }
 
-  const getSeverityColor = (severity: string) => {
-    switch (severity) {
-      case 'CRITICAL':
-      case 'ERROR':
-        return 'rgb(220, 38, 38)'
-      case 'HIGH':
-        return 'rgb(234, 88, 12)'
-      case 'MEDIUM':
-      case 'WARNING':
-        return 'rgb(234, 179, 8)'
-      case 'LOW':
-        return 'rgb(34, 197, 94)'
-      default:
-        return 'rgb(100, 116, 139)'
-    }
+  const exportPDF = () => {
+    if (!result) return
+    window.open(`${BACKEND}/api/scan/${result.scan_id}/report/html`, '_blank')
+    showToast('Opening PDF report (Ctrl+P to save)', 'success')
   }
 
-  const filteredFindings = result?.all_findings.filter(finding => {
-    if (selectedCategory && finding.category !== selectedCategory) return false
-    if (selectedSeverity && finding.severity !== selectedSeverity) return false
+  const getColor = (s: string) => {
+    const n = s === 'ERROR' ? 'CRITICAL' : s === 'WARNING' ? 'MEDIUM' : s
+    return n === 'CRITICAL' ? '#dc2626' : n === 'HIGH' ? '#ea580c' : 
+           n === 'MEDIUM' ? '#eab308' : n === 'LOW' ? '#22c55e' : '#64748b'
+  }
+
+  const filtered = result?.all_findings.filter(f => {
+    if (selectedCat && f.category !== selectedCat) return false
+    if (selectedSev) {
+      const ns = f.severity === 'ERROR' ? 'CRITICAL' : f.severity === 'WARNING' ? 'MEDIUM' : f.severity
+      if (ns !== selectedSev) return false
+    }
+    if (search) {
+      const q = search.toLowerCase()
+      return f.message.toLowerCase().includes(q) || f.file.toLowerCase().includes(q) || 
+             (f.snippet && f.snippet.toLowerCase().includes(q))
+    }
     return true
   }) || []
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
-      {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-950/50 backdrop-blur-sm">
+      {toast && (
+        <div className="fixed top-4 right-4 z-50 px-6 py-4 rounded-xl shadow-2xl animate-slide-in"
+             style={{backgroundColor: toast.type==='success' ? '#10b981' : '#ef4444', color: 'white'}}>
+          <div className="flex gap-3">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} 
+                    d={toast.type==='success' ? "M5 13l4 4L19 7" : "M6 18L18 6M6 6l12 12"} />
+            </svg>
+            <span className="font-medium">{toast.msg}</span>
+          </div>
+        </div>
+      )}
+
+      <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur-xl sticky top-0 z-40">
         <div className="container mx-auto px-6 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-blue-500 rounded-lg flex items-center justify-center">
-                <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-                </svg>
+          <div className="flex justify-between items-center">
+            <div className="flex gap-4 items-center">
+              <div className="relative">
+                <div className="absolute inset-0 bg-blue-500 blur-xl opacity-30 animate-pulse-slow"></div>
+                <div className="relative w-12 h-12 bg-gradient-to-br from-blue-500 to-blue-600 rounded-xl flex items-center justify-center">
+                  <svg className="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                  </svg>
+                </div>
               </div>
+              
               <div>
-                <h1 className="text-xl font-bold text-white">AEGIS PRIME</h1>
-                <p className="text-xs text-slate-400">Security Auditor v1.0</p>
+                <h1 className="text-2xl font-bold bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">ATLAS SYNAPSE</h1>
+                <p className="text-xs text-slate-500 font-medium">SECURITY AUDITOR v2.0</p>
               </div>
             </div>
             
-            {result && (
-              <div className="flex gap-4 text-sm">
-                <div className="text-slate-400">
-                  Semgrep: <span className="text-white font-mono">{result.engines.semgrep?.findings?.length || 0}</span>
-                </div>
-                <div className="text-slate-400">
-                  Gitleaks: <span className="text-white font-mono">{result.engines.gitleaks?.findings?.length || 0}</span>
-                </div>
-                <div className="text-slate-400">
-                  Trivy: <span className="text-white font-mono">{result.engines.trivy?.findings?.length || 0}</span>
-                </div>
-                <div className="text-slate-400">
-                  CodeQL: <span className="text-white font-mono">{result.engines.codeql?.findings?.length || 0}</span>
-                </div>
-              </div>
-            )}
+            <div className="flex gap-3 items-center">
+              {result && (
+                <>
+                  <button onClick={() => setShowCompliance(!showCompliance)}
+                          className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium flex items-center gap-2">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    Compliance
+                  </button>
+                  
+                  <div className="hidden md:flex gap-4 text-sm">
+                    {[{n:'Semgrep',c:result.engines.semgrep?.findings?.length||0},
+                      {n:'Gitleaks',c:result.engines.gitleaks?.findings?.length||0},
+                      {n:'Trivy',c:result.engines.trivy?.findings?.length||0},
+                      {n:'CodeQL',c:result.engines.codeql?.findings?.length||0}].map(e => (
+                      <div key={e.n} className="flex gap-2 items-center">
+                        <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow"></div>
+                        <span className="text-slate-400">{e.n}</span>
+                        <span className="text-white font-mono font-bold">{e.c}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+              
+              <button onClick={() => setShowHistory(!showHistory)} className="p-2 rounded-lg hover:bg-slate-800 text-slate-400">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
       </header>
 
       <div className="container mx-auto px-6 py-8">
-        {/* Risk Score Banner */}
-        {result && (
-          <div 
-            className="mb-8 p-6 rounded-xl border"
-            style={{
-              backgroundColor: `${getRiskColor(result.ai_analysis.risk_level)}15`,
-              borderColor: getRiskColor(result.ai_analysis.risk_level)
-            }}
-          >
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-2xl font-bold text-white mb-2">
-                  RISK SCORE: {result.ai_analysis.risk_score}/100
-                </h2>
-                <p className="text-slate-300">{result.ai_analysis.executive_summary}</p>
+        {result && !showHistory && !showCompliance && (
+          <div className="mb-8 p-8 rounded-2xl border-2 shadow-2xl animate-fade-in"
+               style={{backgroundColor: `${getColor(result.ai_analysis.risk_level)}08`, borderColor: `${getColor(result.ai_analysis.risk_level)}40`}}>
+            <div className="flex justify-between gap-8">
+              <div className="flex-1">
+                <div className="flex gap-3 mb-4 items-center">
+                  <h2 className="text-4xl font-black text-white">RISK: {result.ai_analysis.risk_score}<span className="text-slate-500">/100</span></h2>
+                  <div className="px-4 py-2 rounded-lg font-bold text-sm" style={{backgroundColor: getColor(result.ai_analysis.risk_level), color: 'white'}}>
+                    {result.ai_analysis.risk_level}
+                  </div>
+                </div>
+                <p className="text-slate-300 text-lg mb-4">{result.ai_analysis.executive_summary}</p>
+                {result.ai_analysis.top_priorities && (
+                  <div className="space-y-2">
+                    {result.ai_analysis.top_priorities.slice(0,3).map((p,i) => (
+                      <div key={i} className="flex gap-3 text-sm">
+                        <span className="px-2 py-0.5 rounded bg-blue-500 text-white font-bold text-xs">P{i+1}</span>
+                        <span className="text-slate-400">{p}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
-              <div 
-                className="px-6 py-3 rounded-lg font-bold text-lg"
-                style={{ 
-                  backgroundColor: getRiskColor(result.ai_analysis.risk_level),
-                  color: 'white'
-                }}
-              >
-                {result.ai_analysis.risk_level}
+              
+              <div className="flex flex-col gap-2">
+                <button onClick={exportJSON} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  JSON
+                </button>
+                <button onClick={exportSBOM} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  SBOM
+                </button>
+                <button onClick={exportPDF} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                  </svg>
+                  PDF
+                </button>
               </div>
             </div>
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Left Column - Upload & AI Analysis */}
-          <div className="lg:col-span-1 space-y-6">
-            {/* File Upload */}
-            <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-6">
-              <h3 className="text-lg font-semibold text-white mb-4">SCAN TARGET</h3>
-              
-              <div className="space-y-4">
-                <div className="border-2 border-dashed border-slate-700 rounded-lg p-8 text-center hover:border-blue-500 transition-colors">
-                  <input
-                    type="file"
-                    onChange={handleFileSelect}
-                    accept=".py,.js,.ts,.java,.go,.rb,.zip"
-                    className="hidden"
-                    id="file-upload"
-                  />
-                  <label htmlFor="file-upload" className="cursor-pointer">
-                    <svg className="w-12 h-12 mx-auto mb-4 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                    </svg>
-                    {file ? (
-                      <p className="text-blue-400 font-medium">{file.name}</p>
-                    ) : (
-                      <p className="text-slate-400">Drop file or click to browse</p>
-                    )}
-                    <p className="text-xs text-slate-500 mt-2">.py .js .ts .java .go .rb .zip</p>
-                  </label>
+        {showCompliance && compliance && (
+          <div className="mb-8 animate-fade-in">
+            <div className="flex justify-between mb-6">
+              <h2 className="text-2xl font-bold text-white">Compliance Assessment</h2>
+              <button onClick={() => setShowCompliance(false)} className="text-slate-400 hover:text-white">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            
+            <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-6 mb-6">
+              <h3 className="text-lg font-bold text-white mb-4">Overall Status</h3>
+              <p className="text-2xl font-bold mb-2" style={{color: compliance.overall_status.critical_blockers > 0 ? '#dc2626' : '#22c55e'}}>
+                {compliance.overall_status.recommendation}
+              </p>
+              <div className="grid grid-cols-2 gap-4 text-sm mt-4">
+                <div>
+                  <span className="text-slate-500">Critical Blockers:</span>
+                  <span className="ml-2 text-white font-bold">{compliance.overall_status.critical_blockers}</span>
                 </div>
-
-                <button
-                  onClick={handleScan}
-                  disabled={!file || scanning}
-                  className="w-full py-3 px-4 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-700 disabled:cursor-not-allowed text-white font-semibold rounded-lg transition-colors"
-                >
-                  {scanning ? 'SCANNING...' : 'INITIATE SCAN'}
-                </button>
-
-                {error && (
-                  <div className="p-4 bg-red-900/20 border border-red-500 rounded-lg">
-                    <p className="text-red-400 text-sm">{error}</p>
-                  </div>
-                )}
+                <div>
+                  <span className="text-slate-500">Est. Remediation:</span>
+                  <span className="ml-2 text-white font-bold">{compliance.overall_status.estimated_remediation_time}</span>
+                </div>
               </div>
             </div>
-
-            {/* AI Analysis */}
-            {result && (
-              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-6">
-                <h3 className="text-lg font-semibold text-white mb-4">AI ANALYSIS</h3>
-                
-                <div className="space-y-4">
-                  <div>
-                    <h4 className="text-sm font-semibold text-slate-400 mb-2">TOP PRIORITIES</h4>
-                    <ul className="space-y-2">
-                      {result.ai_analysis.top_priorities.map((priority, idx) => (
-                        <li key={idx} className="text-sm text-slate-300 flex gap-2">
-                          <span className="text-blue-400">P{idx + 1}</span>
-                          <span>{priority}</span>
-                        </li>
-                      ))}
-                    </ul>
+            
+            <div className="grid gap-4">
+              {Object.entries(compliance.frameworks).map(([id, data]: [string, any]) => (
+                <div key={id} className="bg-slate-900/50 rounded-xl border border-slate-800 p-6">
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      <h4 className="text-white font-bold">{data.name}</h4>
+                      <p className="text-sm text-slate-500 mt-1">{id}</p>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-2xl font-bold" style={{color: data.violations === 0 ? '#22c55e' : data.violations < 5 ? '#eab308' : '#dc2626'}}>
+                        {data.compliance_percentage}%
+                      </div>
+                      <div className="text-xs text-slate-500">Compliance</div>
+                    </div>
                   </div>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Right Column - Heatmap & Findings */}
-          <div className="lg:col-span-2 space-y-6">
-            {/* Heatmap */}
-            {result && (
-              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-6">
-                <h3 className="text-lg font-semibold text-white mb-4">
-                  RISK HEATMAP
-                  <span className="ml-3 text-sm font-normal text-slate-400">
-                    {result.total_findings} TOTAL FINDINGS
-                  </span>
-                </h3>
-
-                <div className="overflow-x-auto">
-                  <table className="w-full border-collapse">
-                    <thead>
-                      <tr>
-                        <th className="p-2 text-left text-xs text-slate-500"></th>
-                        {['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].map(sev => (
-                          <th key={sev} className="p-2 text-center text-xs text-slate-400 font-semibold">
-                            {sev}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {['SAST', 'Secrets', 'SCA', 'Deep Analysis'].map(category => (
-                        <tr key={category}>
-                          <td className="p-2 text-xs text-slate-400 font-semibold">{category}</td>
-                          {['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].map(severity => {
-                            const cell = result.heatmap_data.find(
-                              d => d.category === category && d.severity === severity
-                            )
-                            const count = cell?.count || 0
-                            const normalized = cell?.normalized || 0
-                            
-                            return (
-                              <td
-                                key={severity}
-                                className="p-2 text-center cursor-pointer hover:ring-2 hover:ring-blue-500 transition-all"
-                                onClick={() => {
-                                  setSelectedCategory(category)
-                                  setSelectedSeverity(severity)
-                                }}
-                                style={{
-                                  backgroundColor: count > 0 
-                                    ? `${getSeverityColor(severity)}${Math.floor(normalized * 255).toString(16).padStart(2, '0')}`
-                                    : 'rgb(30, 41, 59)'
-                                }}
-                              >
-                                <span className="text-white font-bold text-sm">{count}</span>
-                              </td>
-                            )
-                          })}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                {(selectedCategory || selectedSeverity) && (
-                  <button
-                    onClick={() => {
-                      setSelectedCategory(null)
-                      setSelectedSeverity(null)
-                    }}
-                    className="mt-4 text-sm text-blue-400 hover:text-blue-300"
-                  >
-                    Clear filters
-                  </button>
-                )}
-              </div>
-            )}
-
-            {/* Findings Log */}
-            {result && (
-              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-6">
-                <div className="flex items-center justify-between mb-4">
-                  <h3 className="text-lg font-semibold text-white">
-                    AUDIT LOG
-                    {(selectedCategory || selectedSeverity) && (
-                      <span className="ml-3 text-sm font-normal text-slate-400">
-                        Filtered: {filteredFindings.length} of {result.total_findings}
-                      </span>
-                    )}
-                  </h3>
                   
-                  <div className="flex gap-2 text-xs">
-                    {Object.entries(result.severity_breakdown).map(([sev, count]) => (
-                      count > 0 && (
-                        <div key={sev} className="px-2 py-1 rounded" style={{ backgroundColor: `${getSeverityColor(sev)}20`, color: getSeverityColor(sev) }}>
-                          {sev} {count}
-                        </div>
-                      )
-                    ))}
+                  <div className="grid grid-cols-3 gap-4 text-sm">
+                    <div>
+                      <span className="text-slate-500">Violations:</span>
+                      <span className="ml-2 text-white font-bold">{data.violations}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Controls:</span>
+                      <span className="ml-2 text-white font-bold">{data.controls_affected.length}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Critical:</span>
+                      <span className="ml-2 text-red-400 font-bold">{data.severity_distribution?.CRITICAL || 0}</span>
+                    </div>
                   </div>
-                </div>
-
-                <div className="space-y-3 max-h-[600px] overflow-y-auto">
-                  {filteredFindings.length === 0 ? (
-                    <p className="text-slate-500 text-center py-8">
-                      {selectedCategory || selectedSeverity ? 'No findings match the selected filter' : 'No findings detected'}
-                    </p>
-                  ) : (
-                    filteredFindings.map((finding, idx) => (
-                      <div
-                        key={idx}
-                        className="p-4 rounded-lg border"
-                        style={{
-                          backgroundColor: `${getSeverityColor(finding.severity)}10`,
-                          borderColor: `${getSeverityColor(finding.severity)}40`
-                        }}
-                      >
-                        <div className="flex items-start justify-between mb-2">
-                          <div className="flex items-center gap-2">
-                            <span
-                              className="px-2 py-0.5 rounded text-xs font-bold"
-                              style={{
-                                backgroundColor: getSeverityColor(finding.severity),
-                                color: 'white'
-                              }}
-                            >
-                              {finding.severity}
-                            </span>
-                            <span className="text-xs text-slate-400 uppercase">{finding.engine}</span>
-                            {finding.cwe && (
-                              <span className="text-xs text-slate-500">
-                                {Array.isArray(finding.cwe) ? finding.cwe[0] : finding.cwe}
-                              </span>
-                            )}
-                          </div>
-                          <span className="text-xs text-slate-500">
-                            {finding.file}:{finding.line_start}
+                  
+                  {data.controls_affected.length > 0 && (
+                    <div className="mt-3 pt-3 border-t border-slate-800">
+                      <p className="text-xs text-slate-500 mb-2">Affected Controls:</p>
+                      <div className="flex flex-wrap gap-2">
+                        {data.controls_affected.slice(0, 5).map((ctrl: string) => (
+                          <span key={ctrl} className="px-2 py-1 bg-slate-800 text-slate-300 rounded text-xs font-mono">
+                            {ctrl.split(' - ')[0]}
                           </span>
-                        </div>
-                        
-                        <p className="text-sm text-slate-200 mb-2">{finding.message}</p>
-                        
-                        {finding.snippet && (
-                          <pre className="text-xs bg-slate-950 p-2 rounded border border-slate-800 text-slate-400 overflow-x-auto">
-                            {finding.snippet}
-                          </pre>
+                        ))}
+                        {data.controls_affected.length > 5 && (
+                          <span className="px-2 py-1 bg-slate-800 text-slate-500 rounded text-xs">
+                            +{data.controls_affected.length - 5} more
+                          </span>
                         )}
                       </div>
-                    ))
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {!showHistory && !showCompliance && (
+          <div className="grid lg:grid-cols-3 gap-8">
+            <div className="space-y-6">
+              <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6">
+                <h3 className="text-lg font-bold text-white mb-4">SCAN TARGET</h3>
+                
+                <div className="space-y-4">
+                  <div className="relative border-2 border-dashed border-slate-700 rounded-xl p-10 text-center hover:border-blue-500 hover:bg-blue-500/5 group">
+                    <input type="file" onChange={handleFile} accept=".py,.js,.ts,.java,.go,.rb,.zip"
+                           className="absolute inset-0 opacity-0 cursor-pointer" />
+                    
+                    <svg className="w-14 h-14 mx-auto mb-4 text-slate-600 group-hover:text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                    </svg>
+                    
+                    {file ? (
+                      <div><p className="text-blue-400 font-semibold">{file.name}</p>
+                      <p className="text-xs text-slate-500 mt-1">{(file.size/1024).toFixed(1)} KB</p></div>
+                    ) : (
+                      <div><p className="text-slate-400 font-medium">Drop or click</p>
+                      <p className="text-xs text-slate-600 font-mono mt-1">.py .js .ts .java .go .rb</p></div>
+                    )}
+                  </div>
+
+                  <button onClick={handleScan} disabled={!file || scanning}
+                          className="w-full py-4 bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-600 disabled:from-slate-700 disabled:to-slate-700 text-white font-bold rounded-xl text-sm">
+                    {scanning ? 'SCANNING...' : 'INITIATE SCAN'}
+                  </button>
+
+                  {error && (
+                    <div className="p-4 bg-red-900/20 border-2 border-red-500 rounded-xl">
+                      <p className="text-red-400 text-sm">{error}</p>
+                    </div>
                   )}
                 </div>
               </div>
-            )}
 
-            {/* Empty State */}
-            {!result && !scanning && (
-              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-12 text-center">
-                <svg className="w-16 h-16 mx-auto mb-4 text-slate-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-                </svg>
-                <h3 className="text-lg font-semibold text-slate-300 mb-2">Ready to Scan</h3>
-                <p className="text-slate-500">Upload a code file to begin multi-engine security analysis</p>
-              </div>
-            )}
+              {result && (
+                <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6">
+                  <h3 className="text-lg font-bold text-white mb-4">SEVERITY</h3>
+                  <div className="space-y-3">
+                    {Object.entries(result.severity_breakdown).map(([s,c]) => c > 0 && (
+                      <div key={s} className="flex justify-between">
+                        <div className="flex gap-3">
+                          <div className="w-3 h-3 rounded-full mt-0.5" style={{backgroundColor: getColor(s)}}></div>
+                          <span className="text-slate-300 text-sm font-medium">{s}</span>
+                        </div>
+                        <span className="text-white font-bold font-mono">{c}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
 
-            {/* Scanning State */}
-            {scanning && (
-              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-12 text-center">
-                <div className="animate-spin w-16 h-16 mx-auto mb-4 border-4 border-blue-500 border-t-transparent rounded-full"></div>
-                <h3 className="text-lg font-semibold text-white mb-2">Scanning...</h3>
-                <p className="text-slate-400">Running Semgrep, Gitleaks, Trivy, and CodeQL analysis</p>
+            <div className="lg:col-span-2 space-y-6">
+              {result && (
+                <>
+                  <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6">
+                    <h3 className="text-lg font-bold text-white mb-6">RISK HEATMAP
+                      <span className="ml-4 text-sm font-normal text-slate-500">{result.total_findings} findings</span>
+                    </h3>
+
+                    <table className="w-full">
+                      <thead>
+                        <tr>
+                          <th className="p-3 text-left text-xs text-slate-600"></th>
+                          {['CRITICAL','HIGH','MEDIUM','LOW'].map(s => <th key={s} className="p-3 text-center text-xs text-slate-500 font-bold">{s}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {['SAST','Secrets','SCA','Deep Analysis'].map(cat => (
+                          <tr key={cat} className="border-t border-slate-800">
+                            <td className="p-3 text-sm text-slate-400 font-bold">{cat}</td>
+                            {['CRITICAL','HIGH','MEDIUM','LOW'].map(sev => {
+                              const cell = result.heatmap_data.find(d => d.category===cat && d.severity===sev)
+                              const count = cell?.count || 0
+                              return (
+                                <td key={sev} onClick={() => {setSelectedCat(cat); setSelectedSev(sev)}}
+                                    className="p-3 text-center cursor-pointer hover:ring-2 hover:ring-blue-400 rounded-lg"
+                                    style={{backgroundColor: count > 0 ? `${getColor(sev)}${Math.floor((cell?.normalized||0)*180).toString(16).padStart(2,'0')}` : '#1e293b'}}>
+                                  <span className="text-white font-black text-lg">{count}</span>
+                                </td>
+                              )
+                            })}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+
+                    {(selectedCat || selectedSev) && (
+                      <button onClick={() => {setSelectedCat(null); setSelectedSev(null); setSearch('')}}
+                              className="mt-4 text-sm text-blue-400 hover:text-blue-300">Clear filters</button>
+                    )}
+                  </div>
+
+                  <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6">
+                    <div className="flex gap-4 mb-6">
+                      <h3 className="text-lg font-bold text-white flex-1">AUDIT LOG</h3>
+                      <input type="text" value={search} onChange={(e) => setSearch(e.target.value)}
+                             placeholder="Search..." className="flex-1 max-w-md pl-10 pr-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-blue-500 text-sm" />
+                    </div>
+
+                    <div className="space-y-3 max-h-[700px] overflow-y-auto custom-scrollbar">
+                      {filtered.length === 0 ? (
+                        <p className="text-slate-500 text-center py-12">No findings</p>
+                      ) : (
+                        filtered.map((f,i) => {
+                          const isExp = expanded === f.id+i
+                          return (
+                            <div key={i} className="rounded-xl border-2 p-5 cursor-pointer hover:bg-white/5"
+                                 style={{backgroundColor: `${getColor(f.severity)}08`, borderColor: `${getColor(f.severity)}40`}}
+                                 onClick={() => setExpanded(isExp ? null : f.id+i)}>
+                              <div className="flex justify-between mb-3">
+                                <div className="flex gap-2">
+                                  <span className="px-3 py-1 rounded-lg text-xs font-black" style={{backgroundColor: getColor(f.severity), color: 'white'}}>
+                                    {f.severity}
+                                  </span>
+                                  <span className="px-2 py-1 bg-slate-800 text-slate-300 rounded text-xs uppercase">{f.engine}</span>
+                                  {f.cwe && <span className="text-xs text-slate-500 font-mono">{Array.isArray(f.cwe) ? f.cwe[0] : f.cwe}</span>}
+                                </div>
+                                <span className="text-xs text-slate-500 font-mono">{f.file}:{f.line_start}</span>
+                              </div>
+                              
+                              <p className="text-slate-200 mb-3">{f.message}</p>
+                              
+                              {f.snippet && (
+                                <pre className="text-xs bg-slate-950/50 p-3 rounded-lg border border-slate-800 text-slate-400 font-mono overflow-x-auto">
+                                  {isExp ? f.snippet : f.snippet.substring(0,100)+(f.snippet.length>100?'...':'')}
+                                </pre>
+                              )}
+                            </div>
+                          )
+                        })
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {!result && !scanning && (
+                <div className="bg-slate-900/30 rounded-2xl border border-slate-800 p-16 text-center">
+                  <svg className="w-20 h-20 mx-auto mb-6 text-slate-700" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                  </svg>
+                  <h3 className="text-xl font-bold text-slate-300 mb-2">Ready to Scan</h3>
+                  <p className="text-slate-500">Upload code for multi-engine analysis</p>
+                </div>
+              )}
+
+              {scanning && (
+                <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-16 text-center">
+                  <div className="animate-spin-slow w-20 h-20 mx-auto mb-6 border-4 border-blue-500/20 border-t-blue-500 rounded-full"></div>
+                  <h3 className="text-xl font-bold text-white mb-3">Scanning...</h3>
+                  <p className="text-slate-400">Running 4 security engines + AI analysis</p>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {showHistory && (
+          <div className="animate-fade-in">
+            <div className="flex justify-between mb-6">
+              <h2 className="text-2xl font-bold text-white">Scan History</h2>
+              <button onClick={() => setShowHistory(false)} className="text-slate-400 hover:text-white">×</button>
+            </div>
+            {history.length === 0 ? (
+              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-12 text-center"><p className="text-slate-500">No history</p></div>
+            ) : (
+              <div className="grid gap-4">
+                {history.map(s => (
+                  <div key={s.scan_id} onClick={() => {setResult(s); setShowHistory(false); const compResp = fetch(`${BACKEND}/api/scan/${s.scan_id}/compliance`).then(r => r.json()).then(setCompliance)}}
+                       className="bg-slate-900/50 rounded-xl border border-slate-800 p-6 hover:border-blue-500 cursor-pointer">
+                    <div className="flex justify-between">
+                      <div>
+                        <h3 className="text-white font-semibold">{s.file}</h3>
+                        <p className="text-sm text-slate-400">{new Date(s.timestamp).toLocaleString()} • {s.total_findings} findings</p>
+                      </div>
+                      <div className="text-3xl font-bold text-white">{s.ai_analysis.risk_score}</div>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>
-        </div>
+        )}
       </div>
     </div>
   )
