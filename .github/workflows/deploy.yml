@@ -40,4 +40,4 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./frontend/dist
-          cname: aegis.atlassynapseai.com  # Optional: custom domain
+          # cname: aegis.atlassynapseai.com  # Disabled - using GitHub Pages URL
