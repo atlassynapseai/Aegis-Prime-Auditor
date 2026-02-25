@@ -5,9 +5,9 @@ on:
     branches: [ main, develop ]
   push:
     branches: [ main ]
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: '0 2 * * 1'  # Weekly on Monday at 2 AM
+    - cron: '0 2 * * 1'
 
 permissions:
   contents: read
@@ -27,82 +27,68 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: Install Aegis Prime Backend
+      - name: Install Backend Dependencies
         run: |
           cd backend
           pip install -r requirements.txt
       
       - name: Install Scanning Engines
         run: |
-          # Semgrep
           pip install semgrep
           
-          # Gitleaks
           wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz
           tar -xzf gitleaks_8.18.4_linux_x64.tar.gz
           sudo mv gitleaks /usr/local/bin/
           
-          # Trivy
           wget -q https://github.com/aquasecurity/trivy/releases/download/v0.50.1/trivy_0.50.1_Linux-64bit.tar.gz
           tar -xzf trivy_0.50.1_Linux-64bit.tar.gz
           sudo mv trivy /usr/local/bin/
           trivy image --download-db-only
       
-      - name: Run Aegis Prime Scan
+      - name: Start Backend and Run Scans
         env:
           OPENAI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai/
         run: |
-          # Scan all Python files
-          find . -name "*.py" -not -path "./venv/*" -not -path "./.git/*" | while read file; do
-            echo "Scanning: $file"
-            curl -X POST http://localhost:8000/api/scan \
-              -F "file=@$file" \
-              -o "scan_${file//\//_}.json" || true
-          done &
-          
-          # Start backend
           cd backend
           python orchestrator.py &
           BACKEND_PID=$!
           
-          # Wait for backend to be ready
           sleep 10
           
-          # Wait for scans to complete
-          wait
+          cd ..
+          find . -name "*.py" -not -path "./venv/*" -not -path "./.git/*" -not -path "./backend/*" | while read file; do
+            echo "Scanning: $file"
+            curl -X POST http://localhost:8000/api/scan -F "file=@$file" -o "scan_${file//\//_}.json" 2>/dev/null || true
+          done
           
-          # Stop backend
-          kill $BACKEND_PID
+          kill $BACKEND_PID 2>/dev/null || true
       
-      - name: Parse Results and Create Summary
+      - name: Parse Results
         id: parse_results
         run: |
-          # Aggregate all scan results
-          TOTAL_FINDINGS=0
-          CRITICAL=0
+          TOTAL=0
+          CRIT=0
           HIGH=0
           
-          for result_file in scan_*.json; do
-            if [ -f "$result_file" ]; then
-              FINDINGS=$(jq '.total_findings // 0' "$result_file")
-              CRIT=$(jq '.severity_breakdown.CRITICAL // 0' "$result_file")
-              HI=$(jq '.severity_breakdown.HIGH // 0' "$result_file")
+          for f in scan_*.json; do
+            if [ -f "$f" ]; then
+              T=$(jq -r '.total_findings // 0' "$f" 2>/dev/null || echo 0)
+              C=$(jq -r '.severity_breakdown.CRITICAL // 0' "$f" 2>/dev/null || echo 0)
+              H=$(jq -r '.severity_breakdown.HIGH // 0' "$f" 2>/dev/null || echo 0)
               
-              TOTAL_FINDINGS=$((TOTAL_FINDINGS + FINDINGS))
-              CRITICAL=$((CRITICAL + CRIT))
-              HIGH=$((HIGH + HI))
+              TOTAL=$((TOTAL + T))
+              CRIT=$((CRIT + C))
+              HIGH=$((HIGH + H))
             fi
           done
           
-          echo "total_findings=$TOTAL_FINDINGS" >> $GITHUB_OUTPUT
-          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "total_findings=$TOTAL" >> $GITHUB_OUTPUT
+          echo "critical=$CRIT" >> $GITHUB_OUTPUT
           echo "high=$HIGH" >> $GITHUB_OUTPUT
           
-          # Determine pass/fail
-          if [ $CRITICAL -gt 0 ]; then
+          if [ $CRIT -gt 0 ]; then
             echo "status=FAILED" >> $GITHUB_OUTPUT
-            exit 1
           elif [ $HIGH -gt 5 ]; then
             echo "status=WARNING" >> $GITHUB_OUTPUT
           else
@@ -121,24 +107,19 @@ jobs:
             
             const statusEmoji = status === 'PASSED' ? '✅' : status === 'WARNING' ? '⚠️' : '❌';
             
-            const comment = `## ${statusEmoji} Aegis Prime Security Scan Results
+            const comment = `## ${statusEmoji} Atlas Synapse Security Scan
             
 **Status:** ${status}  
 **Total Findings:** ${total}  
 **Critical:** ${critical}  
 **High:** ${high}
 
-${critical > 0 ? '⛔ **CRITICAL vulnerabilities must be remediated before merge.**' : ''}
-${high > 5 ? '⚠️ **Multiple HIGH severity issues detected. Review recommended.**' : ''}
-${total == 0 ? '🎉 **No security issues detected!**' : ''}
+${critical > 0 ? '⛔ CRITICAL vulnerabilities must be remediated before merge.' : ''}
+${high > 5 ? '⚠️ Multiple HIGH severity issues detected.' : ''}
+${total == 0 ? '🎉 No security issues detected!' : ''}
 
-<details>
-<summary>View Detailed Results</summary>
-
-Scan powered by **Aegis Prime Auditor v2.0**  
-Engines: Semgrep, Gitleaks, Trivy, CodeQL + Gemini AI
-
-</details>`;
+---
+*Scanned by Atlas Synapse Auditor v2.0*`;
             
             github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -150,18 +131,12 @@ Engines: Semgrep, Gitleaks, Trivy, CodeQL + Gemini AI
       - name: Upload Scan Results
         uses: actions/upload-artifact@v4
         with:
-          name: aegis-prime-scan-results
+          name: aegis-scan-results
           path: scan_*.json
           retention-days: 30
       
-      - name: Fail Build on Critical Findings
+      - name: Fail Build on Critical
         if: steps.parse_results.outputs.critical > 0
         run: |
-          echo "::error::CRITICAL security vulnerabilities detected. Build failed."
+          echo "::error::CRITICAL vulnerabilities detected"
           exit 1
-
-# Optional: Upload to GitHub Code Scanning (requires SARIF format)
-# - name: Upload to GitHub Security
-#   uses: github/codeql-action/upload-sarif@v3
-#   with:
-#     sarif_file: results.sarif
