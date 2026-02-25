@@ -362,6 +362,7 @@ async def root():
 
 @app.post("/api/scan")
 async def scan_code(file: UploadFile = File(...)):
+    """Enhanced scan endpoint supporting ZIP files and returning aggregated results."""
     req_start = time.time()
     
     contents = await file.read()
@@ -373,22 +374,67 @@ async def scan_code(file: UploadFile = File(...)):
     scan_dir.mkdir(exist_ok=True)
     
     try:
+        # Save uploaded file
         file_path = scan_dir / file.filename
         open(file_path, 'wb').write(contents)
         
-        engines, timings = await _run_scanners(str(file_path))
+        # Check if ZIP file
+        files_to_scan = []
+        if file.filename.endswith('.zip'):
+            import zipfile
+            try:
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    zip_ref.extractall(scan_dir / 'extracted')
+                
+                # Find all code files in extracted folder
+                for ext in ['.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs']:
+                    files_to_scan.extend(list((scan_dir / 'extracted').rglob(f'*{ext}')))
+                
+                logger.info(f"Extracted ZIP: {len(files_to_scan)} code files found")
+            except Exception as e:
+                logger.error(f"ZIP extraction failed: {e}")
+                raise HTTPException(400, f"Invalid ZIP file: {e}")
+        else:
+            files_to_scan = [file_path]
         
-        all_findings = []
-        for data in engines.values():
-            all_findings.extend(data.get("findings", []))
+        if not files_to_scan:
+            raise HTTPException(400, "No code files found to scan")
         
-        ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), file.filename)
-        timings["ai_analysis"] = ai_time
+        # Scan all files
+        all_file_results = []
+        aggregate_findings = []
         
-        heatmap = generate_heatmap(all_findings)
+        for scan_file in files_to_scan[:20]:  # Limit to 20 files
+            try:
+                engines, timings = await _run_scanners(str(scan_file))
+                
+                file_findings = []
+                for data in engines.values():
+                    file_findings.extend(data.get("findings", []))
+                
+                all_file_results.append({
+                    "file": scan_file.name,
+                    "findings": len(file_findings),
+                    "engines": engines
+                })
+                
+                aggregate_findings.extend(file_findings)
+                
+            except Exception as e:
+                logger.error(f"Error scanning {scan_file.name}: {e}")
+        
+        # AI analysis on aggregated findings
+        ai_analysis, ai_time = GeminiAnalyzer.analyze(
+            aggregate_findings, 
+            len(aggregate_findings), 
+            file.filename
+        )
+        
+        # Heatmap and severity breakdown
+        heatmap = generate_heatmap(aggregate_findings)
         
         sev_breakdown = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-        for f in all_findings:
+        for f in aggregate_findings:
             s = f.get("severity", "MEDIUM")
             if s in ["CRITICAL", "ERROR"]: sev_breakdown["CRITICAL"] += 1
             elif s == "HIGH": sev_breakdown["HIGH"] += 1
@@ -396,25 +442,30 @@ async def scan_code(file: UploadFile = File(...)):
             else: sev_breakdown["LOW"] += 1
         
         total_time = time.time() - req_start
-        metrics.record(total_time, timings)
         
         result = {
             "scan_id": scan_id,
             "timestamp": datetime.now().isoformat(),
             "file": file.filename,
-            "engines": engines,
-            "all_findings": all_findings,
-            "total_findings": len(all_findings),
+            "is_batch": len(files_to_scan) > 1,
+            "files_scanned": len(files_to_scan),
+            "file_results": all_file_results,
+            "engines": all_file_results[0]["engines"] if all_file_results else {},
+            "all_findings": aggregate_findings,
+            "total_findings": len(aggregate_findings),
             "ai_analysis": ai_analysis,
             "heatmap_data": heatmap,
             "severity_breakdown": sev_breakdown,
-            "performance": {k: round(v, 2) for k, v in {**timings, "total": total_time}.items()}
+            "performance": {"total": round(total_time, 2)}
         }
         
         SCAN_RESULTS_STORE[scan_id] = result
-        logger.info(f"✅ Scan {scan_id}: {total_time:.2f}s, {len(all_findings)} findings, Risk {ai_analysis['risk_score']}/100")
+        logger.info(f"✅ Scan {scan_id}: {total_time:.2f}s, {len(files_to_scan)} files, {len(aggregate_findings)} findings")
         
         return JSONResponse(content=result)
+        
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Scan failed: {e}")
         raise HTTPException(500, str(e))

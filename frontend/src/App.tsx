@@ -9,6 +9,7 @@ interface Finding {
 
 interface ScanResult {
   scan_id: string; timestamp: string; file: string; total_findings: number
+  is_batch?: boolean; files_scanned?: number; file_results?: Array<{file: string; findings: number}>
   ai_analysis: { executive_summary: string; risk_score: number; risk_level: string; top_priorities?: string[] }
   heatmap_data: Array<{ category: string; severity: string; count: number; normalized: number }>
   all_findings: Finding[]
@@ -65,13 +66,24 @@ function App() {
     if (!f) return
     
     const ext = f.name.substring(f.name.lastIndexOf('.'))
-    if (!['.py','.js','.ts','.java','.go','.rb','.zip'].includes(ext)) {
-      setError('Invalid file type')
+    if (!['.py','.js','.ts','.java','.go','.rb','.zip','.tar','.gz'].includes(ext)) {
+      setError('Invalid file type. Accepted: .py .js .ts .java .go .rb .zip')
       return
     }
+    
+    if (f.size > 50*1024*1024) {
+      setError('File > 50MB')
+      return
+    }
+    
     setFile(f)
     setError(null)
-    showToast(`Selected: ${f.name}`, 'success')
+    
+    if (f.name.endsWith('.zip')) {
+      showToast(`ZIP archive selected: ${f.name} - Will extract and scan all code files`, 'success')
+    } else {
+      showToast(`Selected: ${f.name}`, 'success')
+    }
   }
 
   const handleScan = async () => {
@@ -93,12 +105,20 @@ function App() {
       setResult(data)
       
       // Fetch compliance data
-      const compResp = await fetch(`${BACKEND}/api/scan/${data.scan_id}/compliance`)
-      if (compResp.ok) {
-        setCompliance(await compResp.json())
+      try {
+        const compResp = await fetch(`${BACKEND}/api/scan/${data.scan_id}/compliance`)
+        if (compResp.ok) {
+          setCompliance(await compResp.json())
+        }
+      } catch (e) {
+        console.log('Compliance data unavailable')
       }
       
-      showToast(`Scan complete: ${data.total_findings} findings`, 'success')
+      if (data.is_batch) {
+        showToast(`Batch scan complete: ${data.files_scanned} files, ${data.total_findings} findings`, 'success')
+      } else {
+        showToast(`Scan complete: ${data.total_findings} findings`, 'success')
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Scan failed'
       setError(msg)
@@ -215,7 +235,7 @@ function App() {
                       {n:'Trivy',c:result.engines.trivy?.findings?.length||0},
                       {n:'CodeQL',c:result.engines.codeql?.findings?.length||0}].map(e => (
                       <div key={e.n} className="flex gap-2 items-center">
-                        <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow"></div>
+                        <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow mt-1.5"></div>
                         <span className="text-slate-400">{e.n}</span>
                         <span className="text-white font-mono font-bold">{e.c}</span>
                       </div>
@@ -236,51 +256,66 @@ function App() {
 
       <div className="container mx-auto px-6 py-8">
         {result && !showHistory && !showCompliance && (
-          <div className="mb-8 p-8 rounded-2xl border-2 shadow-2xl animate-fade-in"
-               style={{backgroundColor: `${getColor(result.ai_analysis.risk_level)}08`, borderColor: `${getColor(result.ai_analysis.risk_level)}40`}}>
-            <div className="flex justify-between gap-8">
-              <div className="flex-1">
-                <div className="flex gap-3 mb-4 items-center">
-                  <h2 className="text-4xl font-black text-white">RISK: {result.ai_analysis.risk_score}<span className="text-slate-500">/100</span></h2>
-                  <div className="px-4 py-2 rounded-lg font-bold text-sm" style={{backgroundColor: getColor(result.ai_analysis.risk_level), color: 'white'}}>
-                    {result.ai_analysis.risk_level}
-                  </div>
-                </div>
-                <p className="text-slate-300 text-lg mb-4">{result.ai_analysis.executive_summary}</p>
-                {result.ai_analysis.top_priorities && (
-                  <div className="space-y-2">
-                    {result.ai_analysis.top_priorities.slice(0,3).map((p,i) => (
-                      <div key={i} className="flex gap-3 text-sm">
-                        <span className="px-2 py-0.5 rounded bg-blue-500 text-white font-bold text-xs">P{i+1}</span>
-                        <span className="text-slate-400">{p}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-              
-              <div className="flex flex-col gap-2">
-                <button onClick={exportJSON} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                  JSON
-                </button>
-                <button onClick={exportSBOM} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <>
+            {result.is_batch && (
+              <div className="mb-4 p-4 bg-blue-900/20 border-2 border-blue-500 rounded-xl animate-fade-in">
+                <div className="flex items-center gap-3">
+                  <svg className="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
-                  SBOM
-                </button>
-                <button onClick={exportPDF} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                  </svg>
-                  PDF
-                </button>
+                  <p className="text-blue-300 font-medium">
+                    📦 Batch Scan: {result.files_scanned} files analyzed from ZIP archive
+                  </p>
+                </div>
+              </div>
+            )}
+            
+            <div className="mb-8 p-8 rounded-2xl border-2 shadow-2xl animate-fade-in"
+                 style={{backgroundColor: `${getColor(result.ai_analysis.risk_level)}08`, borderColor: `${getColor(result.ai_analysis.risk_level)}40`}}>
+              <div className="flex justify-between gap-8">
+                <div className="flex-1">
+                  <div className="flex gap-3 mb-4 items-center">
+                    <h2 className="text-4xl font-black text-white">RISK: {result.ai_analysis.risk_score}<span className="text-slate-500">/100</span></h2>
+                    <div className="px-4 py-2 rounded-lg font-bold text-sm" style={{backgroundColor: getColor(result.ai_analysis.risk_level), color: 'white'}}>
+                      {result.ai_analysis.risk_level}
+                    </div>
+                  </div>
+                  <p className="text-slate-300 text-lg mb-4">{result.ai_analysis.executive_summary}</p>
+                  {result.ai_analysis.top_priorities && (
+                    <div className="space-y-2">
+                      {result.ai_analysis.top_priorities.slice(0,3).map((p,i) => (
+                        <div key={i} className="flex gap-3 text-sm">
+                          <span className="px-2 py-0.5 rounded bg-blue-500 text-white font-bold text-xs">P{i+1}</span>
+                          <span className="text-slate-400">{p}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                
+                <div className="flex flex-col gap-2">
+                  <button onClick={exportJSON} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    JSON
+                  </button>
+                  <button onClick={exportSBOM} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    SBOM
+                  </button>
+                  <button onClick={exportPDF} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                    </svg>
+                    PDF
+                  </button>
+                </div>
               </div>
             </div>
-          </div>
+          </>
         )}
 
         {showCompliance && compliance && (
@@ -373,7 +408,8 @@ function App() {
                 
                 <div className="space-y-4">
                   <div className="relative border-2 border-dashed border-slate-700 rounded-xl p-10 text-center hover:border-blue-500 hover:bg-blue-500/5 group">
-                    <input type="file" onChange={handleFile} accept=".py,.js,.ts,.java,.go,.rb,.zip"
+                    <input type="file" onChange={handleFile} 
+                           accept=".py,.js,.ts,.java,.go,.rb,.zip,.tar,.gz,.php,.c,.cpp,.cs"
                            className="absolute inset-0 opacity-0 cursor-pointer" />
                     
                     <svg className="w-14 h-14 mx-auto mb-4 text-slate-600 group-hover:text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -381,11 +417,19 @@ function App() {
                     </svg>
                     
                     {file ? (
-                      <div><p className="text-blue-400 font-semibold">{file.name}</p>
-                      <p className="text-xs text-slate-500 mt-1">{(file.size/1024).toFixed(1)} KB</p></div>
+                      <div>
+                        <p className="text-blue-400 font-semibold">{file.name}</p>
+                        <p className="text-xs text-slate-500 mt-1">
+                          {(file.size/1024).toFixed(1)} KB
+                          {file.name.endsWith('.zip') && ' • ZIP Archive'}
+                        </p>
+                      </div>
                     ) : (
-                      <div><p className="text-slate-400 font-medium">Drop or click</p>
-                      <p className="text-xs text-slate-600 font-mono mt-1">.py .js .ts .java .go .rb</p></div>
+                      <div>
+                        <p className="text-slate-400 font-medium">Drop file or click to browse</p>
+                        <p className="text-xs text-slate-600 font-mono mt-1">.py .js .ts .java .go .rb .zip</p>
+                        <p className="text-xs text-slate-700 mt-2">📦 ZIP files: Extract and scan all code files</p>
+                      </div>
                     )}
                   </div>
 
@@ -423,9 +467,9 @@ function App() {
             <div className="lg:col-span-2 space-y-6">
               {result && (
                 <>
-                  <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6">
+                  <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6 animate-fade-in">
                     <h3 className="text-lg font-bold text-white mb-6">RISK HEATMAP
-                      <span className="ml-4 text-sm font-normal text-slate-500">{result.total_findings} findings</span>
+                      <span className="ml-4 text-sm font-normal text-slate-500">{result.total_findings} findings{result.is_batch && ` across ${result.files_scanned} files`}</span>
                     </h3>
 
                     <table className="w-full">
@@ -444,7 +488,7 @@ function App() {
                               const count = cell?.count || 0
                               return (
                                 <td key={sev} onClick={() => {setSelectedCat(cat); setSelectedSev(sev)}}
-                                    className="p-3 text-center cursor-pointer hover:ring-2 hover:ring-blue-400 rounded-lg"
+                                    className="p-3 text-center cursor-pointer hover:ring-2 hover:ring-blue-400 rounded-lg transition-all"
                                     style={{backgroundColor: count > 0 ? `${getColor(sev)}${Math.floor((cell?.normalized||0)*180).toString(16).padStart(2,'0')}` : '#1e293b'}}>
                                   <span className="text-white font-black text-lg">{count}</span>
                                 </td>
@@ -461,41 +505,56 @@ function App() {
                     )}
                   </div>
 
-                  <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6">
+                  <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6 animate-fade-in">
                     <div className="flex gap-4 mb-6">
                       <h3 className="text-lg font-bold text-white flex-1">AUDIT LOG</h3>
-                      <input type="text" value={search} onChange={(e) => setSearch(e.target.value)}
-                             placeholder="Search..." className="flex-1 max-w-md pl-10 pr-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:ring-2 focus:ring-blue-500 text-sm" />
+                      <div className="relative flex-1 max-w-md">
+                        <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                        </svg>
+                        <input type="text" value={search} onChange={(e) => setSearch(e.target.value)}
+                               placeholder="Search findings..."
+                               className="w-full pl-10 pr-4 py-2 bg-slate-800 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm" />
+                      </div>
                     </div>
 
                     <div className="space-y-3 max-h-[700px] overflow-y-auto custom-scrollbar">
                       {filtered.length === 0 ? (
-                        <p className="text-slate-500 text-center py-12">No findings</p>
+                        <p className="text-slate-500 text-center py-12">No findings match filters</p>
                       ) : (
                         filtered.map((f,i) => {
                           const isExp = expanded === f.id+i
                           return (
-                            <div key={i} className="rounded-xl border-2 p-5 cursor-pointer hover:bg-white/5"
+                            <div key={i} className="rounded-xl border-2 cursor-pointer hover:bg-white/5 transition-all"
                                  style={{backgroundColor: `${getColor(f.severity)}08`, borderColor: `${getColor(f.severity)}40`}}
                                  onClick={() => setExpanded(isExp ? null : f.id+i)}>
-                              <div className="flex justify-between mb-3">
-                                <div className="flex gap-2">
-                                  <span className="px-3 py-1 rounded-lg text-xs font-black" style={{backgroundColor: getColor(f.severity), color: 'white'}}>
-                                    {f.severity}
-                                  </span>
-                                  <span className="px-2 py-1 bg-slate-800 text-slate-300 rounded text-xs uppercase">{f.engine}</span>
-                                  {f.cwe && <span className="text-xs text-slate-500 font-mono">{Array.isArray(f.cwe) ? f.cwe[0] : f.cwe}</span>}
+                              <div className="p-5">
+                                <div className="flex justify-between mb-3">
+                                  <div className="flex gap-2 flex-wrap">
+                                    <span className="px-3 py-1 rounded-lg text-xs font-black" style={{backgroundColor: getColor(f.severity), color: 'white'}}>
+                                      {f.severity}
+                                    </span>
+                                    <span className="px-2 py-1 bg-slate-800 text-slate-300 rounded text-xs uppercase">{f.engine}</span>
+                                    {f.cwe && <span className="text-xs text-slate-500 font-mono">{Array.isArray(f.cwe) ? f.cwe[0] : f.cwe}</span>}
+                                  </div>
+                                  <span className="text-xs text-slate-500 font-mono whitespace-nowrap">{f.file}:{f.line_start}</span>
                                 </div>
-                                <span className="text-xs text-slate-500 font-mono">{f.file}:{f.line_start}</span>
+                                
+                                <p className="text-slate-200 mb-3 leading-relaxed">{f.message}</p>
+                                
+                                {f.snippet && (
+                                  <pre className="text-xs bg-slate-950/50 p-3 rounded-lg border border-slate-800 text-slate-400 font-mono overflow-x-auto">
+                                    {isExp ? f.snippet : (f.snippet.substring(0,100) + (f.snippet.length > 100 ? '...' : ''))}
+                                  </pre>
+                                )}
+                                
+                                <div className="mt-3 flex items-center justify-between">
+                                  <span className="text-xs text-slate-600">{isExp ? 'Click to collapse' : 'Click for details'}</span>
+                                  <svg className={`w-4 h-4 text-slate-600 transition-transform ${isExp ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                                  </svg>
+                                </div>
                               </div>
-                              
-                              <p className="text-slate-200 mb-3">{f.message}</p>
-                              
-                              {f.snippet && (
-                                <pre className="text-xs bg-slate-950/50 p-3 rounded-lg border border-slate-800 text-slate-400 font-mono overflow-x-auto">
-                                  {isExp ? f.snippet : f.snippet.substring(0,100)+(f.snippet.length>100?'...':'')}
-                                </pre>
-                              )}
                             </div>
                           )
                         })
@@ -511,7 +570,8 @@ function App() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
                   </svg>
                   <h3 className="text-xl font-bold text-slate-300 mb-2">Ready to Scan</h3>
-                  <p className="text-slate-500">Upload code for multi-engine analysis</p>
+                  <p className="text-slate-500 mb-1">Upload a code file or ZIP archive</p>
+                  <p className="text-xs text-slate-600">ZIP files will be extracted and all code files scanned</p>
                 </div>
               )}
 
@@ -519,7 +579,11 @@ function App() {
                 <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-16 text-center">
                   <div className="animate-spin-slow w-20 h-20 mx-auto mb-6 border-4 border-blue-500/20 border-t-blue-500 rounded-full"></div>
                   <h3 className="text-xl font-bold text-white mb-3">Scanning...</h3>
-                  <p className="text-slate-400">Running 4 security engines + AI analysis</p>
+                  <p className="text-slate-400">
+                    {file?.name.endsWith('.zip') 
+                      ? 'Extracting ZIP and scanning all code files...' 
+                      : 'Running 4 security engines + AI analysis'}
+                  </p>
                 </div>
               )}
             </div>
@@ -530,21 +594,44 @@ function App() {
           <div className="animate-fade-in">
             <div className="flex justify-between mb-6">
               <h2 className="text-2xl font-bold text-white">Scan History</h2>
-              <button onClick={() => setShowHistory(false)} className="text-slate-400 hover:text-white">×</button>
+              <button onClick={() => setShowHistory(false)} className="text-slate-400 hover:text-white">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
             </div>
             {history.length === 0 ? (
-              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-12 text-center"><p className="text-slate-500">No history</p></div>
+              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-12 text-center"><p className="text-slate-500">No scan history</p></div>
             ) : (
               <div className="grid gap-4">
                 {history.map(s => (
-                  <div key={s.scan_id} onClick={() => {setResult(s); setShowHistory(false); const compResp = fetch(`${BACKEND}/api/scan/${s.scan_id}/compliance`).then(r => r.json()).then(setCompliance)}}
-                       className="bg-slate-900/50 rounded-xl border border-slate-800 p-6 hover:border-blue-500 cursor-pointer">
+                  <div key={s.scan_id} 
+                       onClick={() => {
+                         setResult(s); 
+                         setShowHistory(false);
+                         fetch(`${BACKEND}/api/scan/${s.scan_id}/compliance`)
+                           .then(r => r.json())
+                           .then(setCompliance)
+                           .catch(() => {})
+                       }}
+                       className="bg-slate-900/50 rounded-xl border border-slate-800 p-6 hover:border-blue-500 cursor-pointer transition-all">
                     <div className="flex justify-between">
-                      <div>
-                        <h3 className="text-white font-semibold">{s.file}</h3>
+                      <div className="flex-1">
+                        <div className="flex gap-3 mb-2 items-center">
+                          <h3 className="text-white font-semibold">{s.file}</h3>
+                          {s.is_batch && (
+                            <span className="px-2 py-0.5 bg-blue-600 text-white rounded text-xs font-bold">
+                              {s.files_scanned} files
+                            </span>
+                          )}
+                          <span className="text-xs text-slate-500 font-mono">{s.scan_id}</span>
+                        </div>
                         <p className="text-sm text-slate-400">{new Date(s.timestamp).toLocaleString()} • {s.total_findings} findings</p>
                       </div>
-                      <div className="text-3xl font-bold text-white">{s.ai_analysis.risk_score}</div>
+                      <div className="text-right">
+                        <div className="text-3xl font-bold text-white">{s.ai_analysis.risk_score}</div>
+                        <div className="text-xs text-slate-500">RISK</div>
+                      </div>
                     </div>
                   </div>
                 ))}
