@@ -26,6 +26,7 @@ from background_processor import FilePrioritizer, BackgroundScanManager, backgro
 from file_parsers import FileParser
 from sbom_compliance import SBOMGenerator, ComplianceMapper
 from pdf_generator import ReportGenerator
+from typing import List, Dict, Any
 
 # Logging
 logging.basicConfig(
@@ -359,67 +360,77 @@ async def root():
     }
 
 @app.post("/api/scan")
-async def scan_code(file: UploadFile = File(...)):
-    """Smart scan with multi-format support and background processing."""
+async def scan_code(files: List[UploadFile] = File(...)):
+    """Multi-file scan supporting individual files or ZIP archives."""
     import zipfile
     
     req_start = time.time()
-    contents = await file.read()
-    
-    if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, f"File > {MAX_UPLOAD_MB}MB")
-    
     scan_id = str(uuid.uuid4())[:8]
     scan_dir = UPLOAD_DIR / scan_id
     scan_dir.mkdir(exist_ok=True)
     
     try:
-        file_path = scan_dir / file.filename
-        open(file_path, 'wb').write(contents)
-        
         files_to_scan = []
+        uploaded_files = []
         
-        # Handle ZIP
-        if file.filename.endswith('.zip'):
-            try:
-                with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    code_exts = {'.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs',
-                                '.jsx', '.tsx', '.html', '.htm', '.xml', '.pdf', '.docx', '.xlsx',
-                                '.txt', '.md', '.json', '.yaml', '.yml'}
-                    
-                    for zip_info in zip_ref.filelist:
-                        if zip_info.is_dir():
-                            continue
+        # Process each uploaded file
+        for uploaded_file in files:
+            contents = await uploaded_file.read()
+            
+            if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
+                logger.warning(f"Skipping {uploaded_file.filename} - too large")
+                continue
+            
+            file_path = scan_dir / uploaded_file.filename
+            open(file_path, 'wb').write(contents)
+            uploaded_files.append(uploaded_file.filename)
+            
+            # Handle ZIP extraction
+            if uploaded_file.filename.endswith('.zip'):
+                try:
+                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                        code_exts = {'.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs',
+                                    '.jsx', '.tsx', '.html', '.htm', '.xml', '.pdf', '.docx', '.xlsx',
+                                    '.txt', '.md', '.json', '.yaml', '.yml'}
                         
-                        if Path(zip_info.filename).suffix.lower() in code_exts:
-                            zip_ref.extract(zip_info, scan_dir / 'extracted')
-                            extracted = scan_dir / 'extracted' / zip_info.filename
+                        for zip_info in zip_ref.filelist:
+                            if zip_info.is_dir():
+                                continue
                             
-                            if extracted.exists() and extracted.stat().st_size < 5 * 1024 * 1024:
-                                files_to_scan.append(extracted)
-                    
-                    logger.info(f"ZIP: {len(files_to_scan)} files found")
-            except Exception as e:
-                raise HTTPException(400, f"Invalid ZIP: {e}")
-        else:
-            files_to_scan = [file_path]
+                            if Path(zip_info.filename).suffix.lower() in code_exts:
+                                zip_ref.extract(zip_info, scan_dir / 'extracted')
+                                extracted = scan_dir / 'extracted' / zip_info.filename
+                                
+                                if extracted.exists() and extracted.stat().st_size < 5 * 1024 * 1024:
+                                    files_to_scan.append(extracted)
+                        
+                        logger.info(f"ZIP {uploaded_file.filename}: {len(files_to_scan)} files extracted")
+                except Exception as e:
+                    logger.error(f"ZIP extraction failed for {uploaded_file.filename}: {e}")
+            else:
+                # Regular file
+                files_to_scan.append(file_path)
         
         if not files_to_scan:
             raise HTTPException(400, "No scannable files found")
         
         # Smart prioritization
-        files_to_scan = FilePrioritizer.filter_scannable(files_to_scan, max_files=15)
+        files_to_scan = FilePrioritizer.filter_scannable(files_to_scan, max_files=20)
         
-        # Scan
+        logger.info(f"Scanning {len(files_to_scan)} files from {len(uploaded_files)} uploads")
+        
+        # Scan all files
         all_findings = []
         files_scanned = []
         
         if len(files_to_scan) == 1:
+            # Single file: full scan with all engines
             engines, timings = await _run_scanners(str(files_to_scan[0]))
             for data in engines.values():
                 all_findings.extend(data.get("findings", []))
             files_scanned.append({"file": files_to_scan[0].name, "findings": len(all_findings)})
         else:
+            # Multiple files: fast scan (Semgrep + CodeQL only)
             async def scan_fast(fpath):
                 loop = asyncio.get_event_loop()
                 s_task = loop.run_in_executor(executor, SemgrepScanner.scan, str(fpath))
@@ -436,13 +447,14 @@ async def scan_code(file: UploadFile = File(...)):
                 files_scanned.append({"file": r["file"], "findings": r["findings"]})
                 all_findings.extend(r["findings_list"])
         
-        # AI
-        ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), file.filename)
+        # AI analysis
+        ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), 
+                                                       f"{len(uploaded_files)} files" if len(uploaded_files) > 1 else uploaded_files[0])
         
         # Heatmap
         heatmap = generate_heatmap(all_findings)
         
-        # Severity
+        # Severity breakdown
         sev_breakdown = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
         for f in all_findings:
             s = f.get("severity", "MEDIUM")
@@ -452,12 +464,12 @@ async def scan_code(file: UploadFile = File(...)):
             else: sev_breakdown["LOW"] += 1
         
         total_time = time.time() - req_start
-        metrics.record(total_time, {"ai": ai_time})
         
         result = {
             "scan_id": scan_id,
             "timestamp": datetime.now().isoformat(),
-            "file": file.filename,
+            "file": ", ".join(uploaded_files) if len(uploaded_files) <= 3 else f"{uploaded_files[0]} + {len(uploaded_files)-1} more",
+            "uploaded_files": uploaded_files,
             "is_batch": len(files_to_scan) > 1,
             "files_scanned": len(files_to_scan),
             "file_results": files_scanned,
@@ -471,9 +483,10 @@ async def scan_code(file: UploadFile = File(...)):
         }
         
         SCAN_RESULTS_STORE[scan_id] = result
-        logger.info(f"✅ Scan {scan_id}: {total_time:.2f}s, {len(files_to_scan)} files, {len(all_findings)} findings")
+        logger.info(f"✅ Multi-file scan {scan_id}: {len(uploaded_files)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
         
         return JSONResponse(content=result)
+        
     except HTTPException:
         raise
     except Exception as e:
