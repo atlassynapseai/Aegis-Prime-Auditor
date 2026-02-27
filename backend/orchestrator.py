@@ -1,6 +1,6 @@
 """
-Atlas Synapse Auditor - Complete Backend
-Multi-engine security scanner with SBOM, Compliance, PDF Reports
+Atlas Synapse Auditor v3.0 - Production Backend
+Multi-file, multi-format security scanner with SBOM, Compliance, PDF Reports
 """
 
 import os
@@ -26,7 +26,6 @@ from background_processor import FilePrioritizer, BackgroundScanManager, backgro
 from file_parsers import FileParser
 from sbom_compliance import SBOMGenerator, ComplianceMapper
 from pdf_generator import ReportGenerator
-from typing import List, Dict, Any
 
 # Logging
 logging.basicConfig(
@@ -152,7 +151,8 @@ class GitleaksScanner:
                     findings.append({
                         "id": item.get("RuleID", ""), "engine": "gitleaks", "category": "Secrets",
                         "severity": "CRITICAL", "message": f"Secret: {item.get('Description', '')}",
-                        "file": item.get("File", ""), "line_start": item.get("StartLine", 0),
+                        "file": Path(item.get("File", "")).name,
+                        "line_start": item.get("StartLine", 0),
                         "snippet": (item.get("Secret", "")[:50] + "...") if item.get("Secret") else ""
                     })
                 report.unlink(missing_ok=True)
@@ -193,20 +193,20 @@ class TrivyScanner:
 
 class CodeQLScanner:
     PATTERNS = {
-        "sql-injection": {"regex": r'(execute|query)\s*\([^)]*[\{\%\+]', "severity": "CRITICAL", "cwe": "CWE-89",
+        "sql-injection": {"regex": r'(execute|query|executeQuery)\s*\([^)]*[\{\%\+]', "severity": "CRITICAL", "cwe": "CWE-89",
                          "message": "SQL Injection: User data in SQL query"},
         "command-injection": {"regex": r'(system|exec|Runtime\.getRuntime)\s*\([^)]*[\+\$]', "severity": "CRITICAL", "cwe": "CWE-78",
                              "message": "Command Injection: User data in OS command"},
-        "hardcoded-secret": {"regex": r'(password|secret|key|token)\s*=\s*["\'][^"\']{8,}', "severity": "HIGH", "cwe": "CWE-798",
+        "hardcoded-secret": {"regex": r'(password|secret|key|token|API_KEY)\s*=\s*["\'][^"\']{8,}', "severity": "HIGH", "cwe": "CWE-798",
                             "message": "Hardcoded Credential"},
-        "weak-crypto": {"regex": r'(md5|sha1)\s*\(', "severity": "MEDIUM", "cwe": "CWE-327",
-                       "message": "Weak Cryptography (MD5/SHA1)"},
+        "weak-crypto": {"regex": r'(md5|sha1|MD5|SHA1)\s*\(', "severity": "MEDIUM", "cwe": "CWE-327",
+                       "message": "Weak Cryptography"},
         "path-traversal": {"regex": r'(open|File)\s*\([^)]*[\+]', "severity": "HIGH", "cwe": "CWE-22",
                           "message": "Path Traversal"},
         "insecure-deser": {"regex": r'(pickle\.load|yaml\.load\s*\([^,)]*\)|ObjectInputStream)', "severity": "CRITICAL", "cwe": "CWE-502",
                           "message": "Insecure Deserialization"},
-        "xss": {"regex": r'innerHTML\s*=', "severity": "HIGH", "cwe": "CWE-79", "message": "XSS Vulnerability"},
-        "eval": {"regex": r'\beval\s*\(', "severity": "CRITICAL", "cwe": "CWE-95", "message": "Code Injection (eval)"}
+        "xss": {"regex": r'innerHTML\s*=', "severity": "HIGH", "cwe": "CWE-79", "message": "XSS"},
+        "eval": {"regex": r'\beval\s*\(', "severity": "CRITICAL", "cwe": "CWE-95", "message": "Code Injection"}
     }
     
     @staticmethod
@@ -349,19 +349,19 @@ async def root():
             "gemini_ai": gemini_client is not None
         },
         "features": {
+            "multi_file_upload": True,
             "multi_format_support": True,
             "sbom_generation": True,
             "compliance_mapping": True,
             "pdf_reports": True,
-            "background_processing": True,
             "frameworks": list(ComplianceMapper.FRAMEWORKS.keys())
         },
         "metrics": metrics.stats()
     }
 
 @app.post("/api/scan")
-async def scan_code(file: UploadFile = File(...)):
-    """Smart scan supporting single files and ZIP archives."""
+async def scan_code(files: List[UploadFile] = File(...)):
+    """Multi-file, multi-format scan with smart prioritization."""
     import zipfile
     
     req_start = time.time()
@@ -371,17 +371,21 @@ async def scan_code(file: UploadFile = File(...)):
     
     try:
         files_to_scan = []
+        uploaded_filenames = []
         
-        # Save single uploaded file
-        contents = await file.read()
-        
-        if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise HTTPException(413, f"File > {MAX_UPLOAD_MB}MB")
-        
-        file_path = scan_dir / file.filename
-        open(file_path, 'wb').write(contents)
+        # Process each uploaded file
+        for uploaded_file in files:
+            contents = await uploaded_file.read()
             
-            # Handle ZIP extraction
+            if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
+                logger.warning(f"Skipping {uploaded_file.filename} - too large")
+                continue
+            
+            file_path = scan_dir / uploaded_file.filename
+            open(file_path, 'wb').write(contents)
+            uploaded_filenames.append(uploaded_file.filename)
+            
+            # Handle ZIP
             if uploaded_file.filename.endswith('.zip'):
                 try:
                     with zipfile.ZipFile(file_path, 'r') as zip_ref:
@@ -400,33 +404,32 @@ async def scan_code(file: UploadFile = File(...)):
                                 if extracted.exists() and extracted.stat().st_size < 5 * 1024 * 1024:
                                     files_to_scan.append(extracted)
                         
-                        logger.info(f"ZIP {uploaded_file.filename}: {len(files_to_scan)} files extracted")
+                        logger.info(f"ZIP {uploaded_file.filename}: {len(files_to_scan)} files")
                 except Exception as e:
-                    logger.error(f"ZIP extraction failed for {uploaded_file.filename}: {e}")
+                    logger.error(f"ZIP extraction failed: {e}")
             else:
-                # Regular file
                 files_to_scan.append(file_path)
         
         if not files_to_scan:
             raise HTTPException(400, "No scannable files found")
         
-        # Smart prioritization
-        files_to_scan = FilePrioritizer.filter_scannable(files_to_scan, max_files=20)
+        # Smart prioritization (limit to 15 for speed)
+        files_to_scan = FilePrioritizer.filter_scannable(files_to_scan, max_files=15)
         
-        logger.info(f"Scanning {len(files_to_scan)} files from {len(uploaded_files)} uploads")
+        logger.info(f"Scanning {len(files_to_scan)} files from {len(uploaded_filenames)} uploads")
         
         # Scan all files
         all_findings = []
         files_scanned = []
         
         if len(files_to_scan) == 1:
-            # Single file: full scan with all engines
+            # Single file: full scan
             engines, timings = await _run_scanners(str(files_to_scan[0]))
             for data in engines.values():
                 all_findings.extend(data.get("findings", []))
             files_scanned.append({"file": files_to_scan[0].name, "findings": len(all_findings)})
         else:
-            # Multiple files: fast scan (Semgrep + CodeQL only)
+            # Multiple files: fast scan (Semgrep + CodeQL)
             async def scan_fast(fpath):
                 loop = asyncio.get_event_loop()
                 s_task = loop.run_in_executor(executor, SemgrepScanner.scan, str(fpath))
@@ -443,14 +446,14 @@ async def scan_code(file: UploadFile = File(...)):
                 files_scanned.append({"file": r["file"], "findings": r["findings"]})
                 all_findings.extend(r["findings_list"])
         
-        # AI analysis
-        ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), 
-                                                       f"{len(uploaded_files)} files" if len(uploaded_files) > 1 else uploaded_files[0])
+        # AI
+        file_desc = ", ".join(uploaded_filenames) if len(uploaded_filenames) <= 3 else f"{uploaded_filenames[0]} + {len(uploaded_filenames)-1} more"
+        ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), file_desc)
         
         # Heatmap
         heatmap = generate_heatmap(all_findings)
         
-        # Severity breakdown
+        # Severity
         sev_breakdown = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
         for f in all_findings:
             s = f.get("severity", "MEDIUM")
@@ -460,12 +463,13 @@ async def scan_code(file: UploadFile = File(...)):
             else: sev_breakdown["LOW"] += 1
         
         total_time = time.time() - req_start
+        metrics.record(total_time, {"ai": ai_time})
         
         result = {
             "scan_id": scan_id,
             "timestamp": datetime.now().isoformat(),
-            "file": ", ".join(uploaded_files) if len(uploaded_files) <= 3 else f"{uploaded_files[0]} + {len(uploaded_files)-1} more",
-            "uploaded_files": uploaded_files,
+            "file": file_desc,
+            "uploaded_files": uploaded_filenames,
             "is_batch": len(files_to_scan) > 1,
             "files_scanned": len(files_to_scan),
             "file_results": files_scanned,
@@ -475,11 +479,13 @@ async def scan_code(file: UploadFile = File(...)):
             "heatmap_data": heatmap,
             "severity_breakdown": sev_breakdown,
             "performance": {"total": round(total_time, 2)},
-            "status": "completed"
+            "status": "completed",
+            "engines": {"semgrep": {"findings": []}, "gitleaks": {"findings": []}, 
+                       "trivy": {"findings": []}, "codeql": {"findings": []}}
         }
         
         SCAN_RESULTS_STORE[scan_id] = result
-        logger.info(f"✅ Multi-file scan {scan_id}: {len(uploaded_files)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
+        logger.info(f"✅ Multi-file scan {scan_id}: {len(uploaded_filenames)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
         
         return JSONResponse(content=result)
         
@@ -570,13 +576,14 @@ if __name__ == "__main__":
     port = int(os.getenv("AEGIS_PORT", "10000"))
     
     print("="*80)
-    print("ATLAS SYNAPSE AUDITOR v3.0 - PRODUCTION EDITION")
+    print("ATLAS SYNAPSE AUDITOR v3.0 - PRODUCTION")
     print("="*80)
-    print(f"🚀 Server: http://{host}:{port}")
+    print(f"🚀 http://{host}:{port}")
     print(f"📊 Docs: http://{host}:{port}/docs")
     print(f"🔧 Gemini: {'✅' if gemini_client else '❌'}")
+    print(f"📁 Multi-File: ✅")
     print(f"📋 Multi-Format: PDF, DOCX, XLSX, HTML, Media")
-    print(f"🎯 Tagline: Trust Engine for AI Systems")
+    print(f"🎯 Trust Engine for AI Systems")
     print("="*80)
     
     uvicorn.run("orchestrator:app", host=host, port=port, reload=False, log_level="info")
