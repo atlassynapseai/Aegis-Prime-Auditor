@@ -128,8 +128,8 @@ metrics = PerformanceMetrics()
 # Scanners (simplified versions)
 class SemgrepScanner:
     @staticmethod
-def scan(path: str):
-    start = time.time()
+    def scan(path: str):
+        start = time.time()
     try:
         # Get scannable content (handles all file types)
         content = FileParser.get_scannable_content(path)
