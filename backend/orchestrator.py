@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from openai import OpenAI
 
 from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
+from specialized_scanners import SpecializedScanner
 from file_parsers import FileParser
 from sbom_compliance import SBOMGenerator, ComplianceMapper
 from pdf_generator import ReportGenerator
@@ -234,6 +235,42 @@ class CodeQLScanner:
         except Exception as e:
             return ({"findings": [], "engine": "codeql", "error": str(e)}, time.time() - start)
 
+class EnhancedScanner:
+    """Combines CodeQL patterns with specialized format scanners."""
+    
+    @staticmethod
+    def scan(path: str):
+        start = time.time()
+        try:
+            content = FileParser.get_scannable_content(path)
+            
+            # Run CodeQL patterns
+            codeql_findings = []
+            lines = content.split('\n')
+            
+            for pid, pd in CodeQLScanner.PATTERNS.items():
+                regex = re.compile(pd["regex"], re.I | re.M)
+                for lnum, line in enumerate(lines, 1):
+                    if regex.search(line):
+                        codeql_findings.append({
+                            "id": f"codeql/{pid}", "engine": "codeql", "category": "Deep Analysis",
+                            "severity": pd["severity"], "message": pd["message"],
+                            "file": Path(path).name, "line_start": lnum,
+                            "snippet": line.strip()[:150], "cwe": pd["cwe"]
+                        })
+            
+            # Run specialized scanners
+            specialized_findings = SpecializedScanner.scan_file_by_type(path, content)
+            
+            # Combine results
+            all_findings = codeql_findings + specialized_findings
+            
+            elapsed = time.time() - start
+            logger.info(f"Enhanced scan: {elapsed:.2f}s, {len(all_findings)} findings ({len(codeql_findings)} CodeQL + {len(specialized_findings)} specialized)")
+            return ({"findings": all_findings, "engine": "enhanced", "error": None}, elapsed)
+            
+        except Exception as e:
+            return ({"findings": [], "engine": "enhanced", "error": str(e)}, time.time() - start)
 # AI
 class GeminiAnalyzer:
     @staticmethod
@@ -433,11 +470,11 @@ async def scan_code(files: List[UploadFile] = File(...)):
             async def scan_fast(fpath):
                 loop = asyncio.get_event_loop()
                 s_task = loop.run_in_executor(executor, SemgrepScanner.scan, str(fpath))
-                c_task = loop.run_in_executor(executor, CodeQLScanner.scan, str(fpath))
+                e_task = loop.run_in_executor(executor, EnhancedScanner.scan, str(fpath))
                 
-                (s_result, _), (c_result, _) = await asyncio.gather(s_task, c_task)
+                (s_result, _), (e_result, _) = await asyncio.gather(s_task, e_task)
                 
-                findings = s_result.get("findings", []) + c_result.get("findings", [])
+                findings = s_result.get("findings", []) + e_result.get("findings", [])
                 return {"file": fpath.name, "findings": len(findings), "findings_list": findings}
             
             results = await asyncio.gather(*[scan_fast(f) for f in files_to_scan])
