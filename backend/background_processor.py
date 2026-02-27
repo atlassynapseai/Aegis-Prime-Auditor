@@ -66,18 +66,21 @@ class FilePrioritizer:
     @classmethod
     def filter_scannable(cls, files: List[Path], max_files: int = 20) -> List[Path]:
         """Filter and prioritize files for scanning."""
-        
-        # Remove skip patterns completely
+    
+        # Only skip truly useless directories
+        skip_dirs = ['__pycache__', 'node_modules', '.git', 'venv', 'env', 'dist', 'build']
+    
+        # Remove only directory-based skips
         filtered = [
             f for f in files 
-            if not any(skip in str(f).lower() for skip in cls.SKIP_PATTERNS)
+            if not any(skip_dir in str(f).lower() for skip_dir in skip_dirs)
             and f.exists()
             and f.stat().st_size < 5 * 1024 * 1024  # Skip files > 5MB
         ]
-        
-        # Prioritize
+    
+        # Prioritize (don't skip files with 'test' or 'vulnerable' in name)
         prioritized = cls.prioritize_files(filtered)
-        
+    
         # Limit to max_files
         return prioritized[:max_files]
 
