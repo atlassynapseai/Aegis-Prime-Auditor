@@ -1,40 +1,11 @@
 """
-Aegis Prime Auditor - Backend Orchestrator
-Multi-engine security scanner with AI-powered analysis
-
-Integrates:
-- Semgrep (SAST)
-- Gitleaks (Secrets)
-- Trivy (SCA)
-- CodeQL-pattern engine (Deep Analysis)
-- Gemini AI (Risk Scoring & Remediation)
-- Performance monitoring and metrics
-- Structured logging
-- Scan history API with pagination
-- Process/Thread pool configuration
-- Extended CodeQL patterns (8 types)
-- Improved error handling
-
-ENHANCEMENTS:
-- Performance monitoring and metrics
-- Structured logging
-- Scan history API with pagination
-- Process/Thread pool configuration
-- Extended CodeQL patterns (8 types)
-- Improved error handling
-
-FEATURES:
-- SBOM Generation (CycloneDX)
-- Compliance Framework Mapping (6 frameworks)
-- PDF/HTML Report Export
-- Performance Monitoring
-- Atlas Synapse Regulatory Rules
+Atlas Synapse Auditor - Complete Backend
+Multi-engine security scanner with SBOM, Compliance, PDF Reports
 """
 
 import os
 import json
 import subprocess
-import tempfile
 import shutil
 import uuid
 import asyncio
@@ -45,13 +16,14 @@ from datetime import datetime
 from typing import List, Dict, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
-from file_parsers import FileParser
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from openai import OpenAI
 
+from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
+from file_parsers import FileParser
 from sbom_compliance import SBOMGenerator, ComplianceMapper
 from pdf_generator import ReportGenerator
 
@@ -66,8 +38,8 @@ logger = logging.getLogger(__name__)
 # App
 app = FastAPI(
     title="Atlas Synapse Auditor",
-    version="2.0.0",
-    description="The Sovereign Standard for Enterprise Security Analysis"
+    version="3.0.0",
+    description="Trust Engine for AI Systems"
 )
 
 app.add_middleware(
@@ -125,52 +97,54 @@ class PerformanceMetrics:
 
 metrics = PerformanceMetrics()
 
-# Scanners (simplified versions)
+# Scanners
 class SemgrepScanner:
     @staticmethod
     def scan(path: str):
         start = time.time()
         try:
-        # Get scannable content (handles all file types)
-        content = FileParser.get_scannable_content(path)
-        
-        # Write to temp file for Semgrep
-        temp_path = Path(path).parent / f"_scannable_{Path(path).name}.tmp"
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-        
-        rules = CONFIG_DIR / "semgrep_rules.yaml"
-        cmd = ["semgrep", f"--config={rules}" if rules.exists() else "--config=auto", "--json", "--quiet", str(temp_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
-        elapsed = time.time() - start
-        
-        # Clean up temp file
-        temp_path.unlink(missing_ok=True)
-        
-        if result.returncode in [0, 1]:
-            data = json.loads(result.stdout)
-            findings = [{
-                "id": f.get("check_id", ""), "engine": "semgrep", "category": "SAST",
-                "severity": f.get("extra", {}).get("severity", "WARNING").upper(),
-                "message": f.get("extra", {}).get("message", f.get("check_id", "")),
-                "file": Path(path).name,  # Use original filename
-                "line_start": f.get("start", {}).get("line", 0),
-                "snippet": f.get("extra", {}).get("lines", ""),
-                "cwe": f.get("extra", {}).get("metadata", {}).get("cwe", [])
-            } for f in data.get("results", [])]
-            return ({"findings": findings, "engine": "semgrep", "error": None}, elapsed)
-        return ({"findings": [], "engine": "semgrep", "error": result.stderr}, elapsed)
-    except Exception as e:
-        return ({"findings": [], "engine": "semgrep", "error": str(e)}, time.time() - start)
+            content = FileParser.get_scannable_content(path)
+            temp_path = Path(path).parent / f"_scan_{Path(path).name}.tmp"
+            
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            rules = CONFIG_DIR / "semgrep_rules.yaml"
+            cmd = ["semgrep", f"--config={rules}" if rules.exists() else "--config=auto", "--json", "--quiet", str(temp_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
+            elapsed = time.time() - start
+            
+            temp_path.unlink(missing_ok=True)
+            
+            if result.returncode in [0, 1]:
+                data = json.loads(result.stdout)
+                findings = [{
+                    "id": f.get("check_id", ""), "engine": "semgrep", "category": "SAST",
+                    "severity": f.get("extra", {}).get("severity", "WARNING").upper(),
+                    "message": f.get("extra", {}).get("message", f.get("check_id", "")),
+                    "file": Path(path).name,
+                    "line_start": f.get("start", {}).get("line", 0),
+                    "snippet": f.get("extra", {}).get("lines", ""),
+                    "cwe": f.get("extra", {}).get("metadata", {}).get("cwe", [])
+                } for f in data.get("results", [])]
+                
+                logger.info(f"Semgrep: {elapsed:.2f}s, {len(findings)} findings")
+                return ({"findings": findings, "engine": "semgrep", "error": None}, elapsed)
+            return ({"findings": [], "engine": "semgrep", "error": result.stderr}, elapsed)
+        except Exception as e:
+            return ({"findings": [], "engine": "semgrep", "error": str(e)}, time.time() - start)
 
 class GitleaksScanner:
     @staticmethod
     def scan(path: str):
         start = time.time()
         try:
-            temp_dir, report = Path(path).parent, Path(path).parent / f"gl_{uuid.uuid4().hex[:8]}.json"
+            temp_dir = Path(path).parent
+            report = temp_dir / f"gl_{uuid.uuid4().hex[:8]}.json"
+            
             subprocess.run(["gitleaks", "detect", "--source", str(temp_dir), "--report-format", "json",
                           "--report-path", str(report), "--no-git"], capture_output=True, timeout=SCAN_TIMEOUT)
+            
             findings = []
             if report.exists():
                 for item in json.load(open(report)):
@@ -181,7 +155,10 @@ class GitleaksScanner:
                         "snippet": (item.get("Secret", "")[:50] + "...") if item.get("Secret") else ""
                     })
                 report.unlink(missing_ok=True)
-            return ({"findings": findings, "engine": "gitleaks", "error": None}, time.time() - start)
+            
+            elapsed = time.time() - start
+            logger.info(f"Gitleaks: {elapsed:.2f}s, {len(findings)} findings")
+            return ({"findings": findings, "engine": "gitleaks", "error": None}, elapsed)
         except Exception as e:
             return ({"findings": [], "engine": "gitleaks", "error": str(e)}, time.time() - start)
 
@@ -192,6 +169,7 @@ class TrivyScanner:
         try:
             result = subprocess.run(["trivy", "fs", "--format", "json", "--scanners", "vuln", "--quiet", str(Path(path).parent)],
                                   capture_output=True, text=True, timeout=SCAN_TIMEOUT)
+            
             findings = []
             if result.returncode == 0:
                 for entry in json.loads(result.stdout).get("Results", []):
@@ -205,7 +183,10 @@ class TrivyScanner:
                             "cve": v.get("VulnerabilityID", ""),
                             "cvss_score": v.get("CVSS", {}).get("nvd", {}).get("V3Score", 0)
                         })
-            return ({"findings": findings, "engine": "trivy", "error": None}, time.time() - start)
+            
+            elapsed = time.time() - start
+            logger.info(f"Trivy: {elapsed:.2f}s, {len(findings)} findings")
+            return ({"findings": findings, "engine": "trivy", "error": None}, elapsed)
         except Exception as e:
             return ({"findings": [], "engine": "trivy", "error": str(e)}, time.time() - start)
 
@@ -228,27 +209,29 @@ class CodeQLScanner:
     }
     
     @staticmethod
-def scan(path: str):
-    start = time.time()
-    try:
-        # Get scannable content
-        content = FileParser.get_scannable_content(path)
-        lines = content.split('\n')
-        
-        findings = []
-        for pid, pd in CodeQLScanner.PATTERNS.items():
-            regex = re.compile(pd["regex"], re.I | re.M)
-            for lnum, line in enumerate(lines, 1):
-                if regex.search(line):
-                    findings.append({
-                        "id": f"codeql/{pid}", "engine": "codeql", "category": "Deep Analysis",
-                        "severity": pd["severity"], "message": pd["message"],
-                        "file": Path(path).name, "line_start": lnum,
-                        "snippet": line.strip()[:150], "cwe": pd["cwe"]
-                    })
-        return ({"findings": findings, "engine": "codeql", "error": None}, time.time() - start)
-    except Exception as e:
-        return ({"findings": [], "engine": "codeql", "error": str(e)}, time.time() - start)
+    def scan(path: str):
+        start = time.time()
+        try:
+            content = FileParser.get_scannable_content(path)
+            lines = content.split('\n')
+            
+            findings = []
+            for pid, pd in CodeQLScanner.PATTERNS.items():
+                regex = re.compile(pd["regex"], re.I | re.M)
+                for lnum, line in enumerate(lines, 1):
+                    if regex.search(line):
+                        findings.append({
+                            "id": f"codeql/{pid}", "engine": "codeql", "category": "Deep Analysis",
+                            "severity": pd["severity"], "message": pd["message"],
+                            "file": Path(path).name, "line_start": lnum,
+                            "snippet": line.strip()[:150], "cwe": pd["cwe"]
+                        })
+            
+            elapsed = time.time() - start
+            logger.info(f"CodeQL: {elapsed:.2f}s, {len(findings)} findings")
+            return ({"findings": findings, "engine": "codeql", "error": None}, elapsed)
+        except Exception as e:
+            return ({"findings": [], "engine": "codeql", "error": str(e)}, time.time() - start)
 
 # AI
 class GeminiAnalyzer:
@@ -264,7 +247,7 @@ class GeminiAnalyzer:
                 s = f.get("severity", "MEDIUM")
                 sev_dist[s] = sev_dist.get(s, 0) + 1
             
-            prompt = f"""Security scan analysis - JSON only:
+            prompt = f"""Security scan - JSON only:
 
 File: {filename}
 Findings: {total}
@@ -315,9 +298,7 @@ Return JSON:
             "top_priorities": [
                 "Remediate CRITICAL findings immediately",
                 "Address HIGH severity within 7 days",
-                "Update vulnerable dependencies",
-                "Implement secure coding practices",
-                "Establish continuous monitoring"
+                "Update vulnerable dependencies"
             ]
         }
 
@@ -330,8 +311,8 @@ def generate_heatmap(findings):
     weights = {"CRITICAL": 1.0, "ERROR": 1.0, "HIGH": 0.75, "MEDIUM": 0.5, "WARNING": 0.5, "LOW": 0.25}
     
     for f in findings:
-        cat, sev = f.get("category", "SAST"), f.get("severity", "MEDIUM")
-        sev = "CRITICAL" if sev == "ERROR" else "MEDIUM" if sev == "WARNING" else sev
+        cat = f.get("category", "SAST")
+        sev = "CRITICAL" if f.get("severity") == "ERROR" else "MEDIUM" if f.get("severity") == "WARNING" else f.get("severity", "MEDIUM")
         key = f"{cat}_{sev}"
         if key in matrix:
             matrix[key]["count"] += 1
@@ -351,14 +332,14 @@ async def _run_scanners(path: str):
     
     return (engines, timings)
 
-# API Endpoints
+# API
 @app.get("/")
 async def root():
     return {
         "service": "Atlas Synapse Auditor",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "status": "operational",
-        "tagline": "The Sovereign Standard for Enterprise Security",
+        "tagline": "Trust Engine for AI Systems",
         "engines": {
             "semgrep": shutil.which("semgrep") is not None,
             "gitleaks": shutil.which("gitleaks") is not None,
@@ -367,18 +348,19 @@ async def root():
             "gemini_ai": gemini_client is not None
         },
         "features": {
+            "multi_format_support": True,
             "sbom_generation": True,
             "compliance_mapping": True,
             "pdf_reports": True,
-            "atlas_regulatory_rules": True,
+            "background_processing": True,
             "frameworks": list(ComplianceMapper.FRAMEWORKS.keys())
         },
         "metrics": metrics.stats()
     }
 
 @app.post("/api/scan")
-async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
-    """Smart scan with priority-based file selection and background processing."""
+async def scan_code(file: UploadFile = File(...)):
+    """Smart scan with multi-format support and background processing."""
     import zipfile
     
     req_start = time.time()
@@ -397,85 +379,55 @@ async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTa
         
         files_to_scan = []
         
-        # Handle ZIP files
+        # Handle ZIP
         if file.filename.endswith('.zip'):
             try:
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    code_extensions = {
-    '.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs', 
-    '.jsx', '.tsx', '.rs', '.kt', '.swift',  # Code
-    '.html', '.htm', '.xml', '.svg',  # Web
-    '.pdf', '.docx', '.doc', '.xlsx', '.xls',  # Documents
-    '.txt', '.md', '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg'  # Text
-}
+                    code_exts = {'.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs',
+                                '.jsx', '.tsx', '.html', '.htm', '.xml', '.pdf', '.docx', '.xlsx',
+                                '.txt', '.md', '.json', '.yaml', '.yml'}
                     
                     for zip_info in zip_ref.filelist:
                         if zip_info.is_dir():
                             continue
                         
-                        file_ext = Path(zip_info.filename).suffix.lower()
-                        if file_ext in code_extensions:
+                        if Path(zip_info.filename).suffix.lower() in code_exts:
                             zip_ref.extract(zip_info, scan_dir / 'extracted')
-                            extracted_path = scan_dir / 'extracted' / zip_info.filename
+                            extracted = scan_dir / 'extracted' / zip_info.filename
                             
-                            if extracted_path.exists() and extracted_path.stat().st_size < 5 * 1024 * 1024:
-                                files_to_scan.append(extracted_path)
+                            if extracted.exists() and extracted.stat().st_size < 5 * 1024 * 1024:
+                                files_to_scan.append(extracted)
                     
-                    logger.info(f"ZIP extraction: {len(files_to_scan)} code files found")
-                    
+                    logger.info(f"ZIP: {len(files_to_scan)} files found")
             except Exception as e:
-                logger.error(f"ZIP extraction failed: {e}")
                 raise HTTPException(400, f"Invalid ZIP: {e}")
         else:
             files_to_scan = [file_path]
         
         if not files_to_scan:
-            raise HTTPException(400, "No code files found")
+            raise HTTPException(400, "No scannable files found")
         
-        # SMART PRIORITIZATION
-        files_to_scan = FilePrioritizer.filter_scannable(files_to_scan, max_files=50)
-        original_count = len(files_to_scan)
+        # Smart prioritization
+        files_to_scan = FilePrioritizer.filter_scannable(files_to_scan, max_files=15)
         
-        # For large batches (>15 files), use background processing
-        if len(files_to_scan) > 15:
-            # Create background task
-            task_info = background_manager.create_task(scan_id, len(files_to_scan))
-            
-            # Return immediately with task ID
-            return JSONResponse(content={
-                "scan_id": scan_id,
-                "status": "processing",
-                "message": f"Large batch detected ({len(files_to_scan)} files). Processing in background...",
-                "total_files": len(files_to_scan),
-                "progress": 0,
-                "estimated_time": f"{len(files_to_scan) * 3}s",
-                "check_status_at": f"/api/scan/{scan_id}/status"
-            })
-            # Background processing happens asynchronously
-        
-        # For small batches (≤15 files), scan immediately
+        # Scan
         all_findings = []
         files_scanned = []
         
-        # Single file: full scan
         if len(files_to_scan) == 1:
             engines, timings = await _run_scanners(str(files_to_scan[0]))
-            
             for data in engines.values():
                 all_findings.extend(data.get("findings", []))
-            
             files_scanned.append({"file": files_to_scan[0].name, "findings": len(all_findings)})
-        
-        # Multiple files: fast parallel scan (Semgrep + CodeQL only)
         else:
             async def scan_fast(fpath):
                 loop = asyncio.get_event_loop()
-                semgrep_task = loop.run_in_executor(executor, SemgrepScanner.scan, str(fpath))
-                codeql_task = loop.run_in_executor(executor, CodeQLScanner.scan, str(fpath))
+                s_task = loop.run_in_executor(executor, SemgrepScanner.scan, str(fpath))
+                c_task = loop.run_in_executor(executor, CodeQLScanner.scan, str(fpath))
                 
-                (semgrep_result, _), (codeql_result, _) = await asyncio.gather(semgrep_task, codeql_task)
+                (s_result, _), (c_result, _) = await asyncio.gather(s_task, c_task)
                 
-                findings = semgrep_result.get("findings", []) + codeql_result.get("findings", [])
+                findings = s_result.get("findings", []) + c_result.get("findings", [])
                 return {"file": fpath.name, "findings": len(findings), "findings_list": findings}
             
             results = await asyncio.gather(*[scan_fast(f) for f in files_to_scan])
@@ -484,13 +436,13 @@ async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTa
                 files_scanned.append({"file": r["file"], "findings": r["findings"]})
                 all_findings.extend(r["findings_list"])
         
-        # AI analysis
+        # AI
         ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), file.filename)
         
         # Heatmap
         heatmap = generate_heatmap(all_findings)
         
-        # Severity breakdown
+        # Severity
         sev_breakdown = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
         for f in all_findings:
             s = f.get("severity", "MEDIUM")
@@ -500,6 +452,7 @@ async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTa
             else: sev_breakdown["LOW"] += 1
         
         total_time = time.time() - req_start
+        metrics.record(total_time, {"ai": ai_time})
         
         result = {
             "scan_id": scan_id,
@@ -507,7 +460,6 @@ async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTa
             "file": file.filename,
             "is_batch": len(files_to_scan) > 1,
             "files_scanned": len(files_to_scan),
-            "files_in_zip": original_count if file.filename.endswith('.zip') else len(files_to_scan),
             "file_results": files_scanned,
             "all_findings": all_findings,
             "total_findings": len(all_findings),
@@ -522,7 +474,6 @@ async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTa
         logger.info(f"✅ Scan {scan_id}: {total_time:.2f}s, {len(files_to_scan)} files, {len(all_findings)} findings")
         
         return JSONResponse(content=result)
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -531,31 +482,22 @@ async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTa
     finally:
         shutil.rmtree(scan_dir, ignore_errors=True)
 
-
-@app.get("/api/scan/{scan_id}/status")
-async def get_scan_status(scan_id: str):
-    """Get background scan progress status."""
-    
-    # Check if completed scan exists
-    if scan_id in SCAN_RESULTS_STORE:
-        return JSONResponse(content={
-            "status": "completed",
-            "result": SCAN_RESULTS_STORE[scan_id]
-        })
-    
-    # Check background task status
-    task_status = background_manager.get_status(scan_id)
-    
-    if task_status["status"] == "not_found":
-        raise HTTPException(404, "Scan not found")
-    
-    return JSONResponse(content=task_status)
-
 @app.get("/api/scan/{scan_id}")
 async def get_scan(scan_id: str):
     if scan_id not in SCAN_RESULTS_STORE:
         raise HTTPException(404, "Scan not found")
     return JSONResponse(content=SCAN_RESULTS_STORE[scan_id])
+
+@app.get("/api/scan/{scan_id}/status")
+async def get_status(scan_id: str):
+    if scan_id in SCAN_RESULTS_STORE:
+        return JSONResponse(content={"status": "completed", "result": SCAN_RESULTS_STORE[scan_id]})
+    
+    task_status = background_manager.get_status(scan_id)
+    if task_status["status"] == "not_found":
+        raise HTTPException(404, "Scan not found")
+    
+    return JSONResponse(content=task_status)
 
 @app.get("/api/scans")
 async def list_scans(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)):
@@ -573,76 +515,59 @@ async def list_scans(limit: int = Query(20, ge=1, le=100), offset: int = Query(0
 async def get_metrics():
     return JSONResponse(content=metrics.stats())
 
-# NEW: Competitive Feature Endpoints
 @app.get("/api/scan/{scan_id}/sbom")
 async def get_sbom(scan_id: str):
-    """Generate SBOM (Software Bill of Materials) - NIST SSDF Compliance."""
     if scan_id not in SCAN_RESULTS_STORE:
         raise HTTPException(404, "Scan not found")
-    
     sbom = SBOMGenerator.generate(SCAN_RESULTS_STORE[scan_id])
-    return JSONResponse(content=sbom, headers={
-        "Content-Disposition": f"attachment; filename=atlas-sbom-{scan_id}.json"
-    })
+    return JSONResponse(content=sbom, headers={"Content-Disposition": f"attachment; filename=atlas-sbom-{scan_id}.json"})
 
 @app.get("/api/scan/{scan_id}/compliance")
 async def get_compliance(scan_id: str):
-    """Generate compliance framework mapping - SOC 2, PCI-DSS, OWASP, NYDFS."""
     if scan_id not in SCAN_RESULTS_STORE:
         raise HTTPException(404, "Scan not found")
-    
     compliance = ComplianceMapper.map_findings_to_compliance(SCAN_RESULTS_STORE[scan_id]["all_findings"])
     return JSONResponse(content=compliance)
 
 @app.get("/api/scan/{scan_id}/report/markdown")
 async def get_md_report(scan_id: str):
-    """Generate executive Markdown report."""
     if scan_id not in SCAN_RESULTS_STORE:
         raise HTTPException(404, "Scan not found")
-    
     scan = SCAN_RESULTS_STORE[scan_id]
     compliance = ComplianceMapper.map_findings_to_compliance(scan["all_findings"])
     report = ReportGenerator.generate_executive_markdown(scan, compliance)
-    
     return JSONResponse(content={"report": report, "format": "markdown"})
 
 @app.get("/api/scan/{scan_id}/report/html")
 async def get_html_report(scan_id: str):
-    """Generate HTML report (PDF-ready via browser print)."""
     if scan_id not in SCAN_RESULTS_STORE:
         raise HTTPException(404, "Scan not found")
-    
     scan = SCAN_RESULTS_STORE[scan_id]
     compliance = ComplianceMapper.map_findings_to_compliance(scan["all_findings"])
     html = ReportGenerator.generate_html_report(scan, compliance)
-    
     return HTMLResponse(content=html)
 
 @app.get("/api/compliance/frameworks")
 async def list_frameworks():
-    """List available compliance frameworks and regulatory rules."""
     return JSONResponse(content={
-        "frameworks": [
-            {"id": k, "name": v.get("name", k), "controls": len(v.get("mappings", {}))}
-            for k, v in ComplianceMapper.FRAMEWORKS.items()
-        ],
-        "atlas_industries": ["fintech", "insurance", "healthcare", "legal"],
-        "total_frameworks": len(ComplianceMapper.FRAMEWORKS)
+        "frameworks": [{"id": k, "name": v.get("name", k)} for k, v in ComplianceMapper.FRAMEWORKS.items()],
+        "total": len(ComplianceMapper.FRAMEWORKS)
     })
 
 if __name__ == "__main__":
     import uvicorn
     
-    host, port = os.getenv("AEGIS_HOST", "0.0.0.0"), int(os.getenv("AEGIS_PORT", "8000"))
+    host = os.getenv("AEGIS_HOST", "0.0.0.0")
+    port = int(os.getenv("AEGIS_PORT", "10000"))
     
     print("="*80)
-    print("ATLAS SYNAPSE AUDITOR v2.0 - COMPETITIVE EDITION")
+    print("ATLAS SYNAPSE AUDITOR v3.0 - PRODUCTION EDITION")
     print("="*80)
     print(f"🚀 Server: http://{host}:{port}")
-    print(f"📊 API Docs: http://{host}:{port}/docs")
-    print(f"🔧 Gemini AI: {'✅' if gemini_client else '❌'}")
-    print(f"📋 Features: SBOM, Compliance (6 frameworks), PDF Reports")
-    print(f"🏢 Atlas Industries: FinTech, Insurance, Healthcare, Legal")
+    print(f"📊 Docs: http://{host}:{port}/docs")
+    print(f"🔧 Gemini: {'✅' if gemini_client else '❌'}")
+    print(f"📋 Multi-Format: PDF, DOCX, XLSX, HTML, Media")
+    print(f"🎯 Tagline: Trust Engine for AI Systems")
     print("="*80)
     
     uvicorn.run("orchestrator:app", host=host, port=port, reload=False, log_level="info")
