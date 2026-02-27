@@ -1,4 +1,3 @@
-from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
 """
 Aegis Prime Auditor - Backend Orchestrator
 Multi-engine security scanner with AI-powered analysis
@@ -46,7 +45,8 @@ from datetime import datetime
 from typing import List, Dict, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-
+from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
+from file_parsers import FileParser
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -128,28 +128,40 @@ metrics = PerformanceMetrics()
 # Scanners (simplified versions)
 class SemgrepScanner:
     @staticmethod
-    def scan(path: str):
-        start = time.time()
-        try:
-            rules = CONFIG_DIR / "semgrep_rules.yaml"
-            cmd = ["semgrep", f"--config={rules}" if rules.exists() else "--config=auto", "--json", "--quiet", path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
-            elapsed = time.time() - start
-            
-            if result.returncode in [0, 1]:
-                data = json.loads(result.stdout)
-                findings = [{
-                    "id": f.get("check_id", ""), "engine": "semgrep", "category": "SAST",
-                    "severity": f.get("extra", {}).get("severity", "WARNING").upper(),
-                    "message": f.get("extra", {}).get("message", f.get("check_id", "")),
-                    "file": f.get("path", ""), "line_start": f.get("start", {}).get("line", 0),
-                    "snippet": f.get("extra", {}).get("lines", ""),
-                    "cwe": f.get("extra", {}).get("metadata", {}).get("cwe", [])
-                } for f in data.get("results", [])]
-                return ({"findings": findings, "engine": "semgrep", "error": None}, elapsed)
-            return ({"findings": [], "engine": "semgrep", "error": result.stderr}, elapsed)
-        except Exception as e:
-            return ({"findings": [], "engine": "semgrep", "error": str(e)}, time.time() - start)
+def scan(path: str):
+    start = time.time()
+    try:
+        # Get scannable content (handles all file types)
+        content = FileParser.get_scannable_content(path)
+        
+        # Write to temp file for Semgrep
+        temp_path = Path(path).parent / f"_scannable_{Path(path).name}.tmp"
+        with open(temp_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        
+        rules = CONFIG_DIR / "semgrep_rules.yaml"
+        cmd = ["semgrep", f"--config={rules}" if rules.exists() else "--config=auto", "--json", "--quiet", str(temp_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=SCAN_TIMEOUT)
+        elapsed = time.time() - start
+        
+        # Clean up temp file
+        temp_path.unlink(missing_ok=True)
+        
+        if result.returncode in [0, 1]:
+            data = json.loads(result.stdout)
+            findings = [{
+                "id": f.get("check_id", ""), "engine": "semgrep", "category": "SAST",
+                "severity": f.get("extra", {}).get("severity", "WARNING").upper(),
+                "message": f.get("extra", {}).get("message", f.get("check_id", "")),
+                "file": Path(path).name,  # Use original filename
+                "line_start": f.get("start", {}).get("line", 0),
+                "snippet": f.get("extra", {}).get("lines", ""),
+                "cwe": f.get("extra", {}).get("metadata", {}).get("cwe", [])
+            } for f in data.get("results", [])]
+            return ({"findings": findings, "engine": "semgrep", "error": None}, elapsed)
+        return ({"findings": [], "engine": "semgrep", "error": result.stderr}, elapsed)
+    except Exception as e:
+        return ({"findings": [], "engine": "semgrep", "error": str(e)}, time.time() - start)
 
 class GitleaksScanner:
     @staticmethod
@@ -216,24 +228,27 @@ class CodeQLScanner:
     }
     
     @staticmethod
-    def scan(path: str):
-        start = time.time()
-        try:
-            lines = open(path, 'r', encoding='utf-8', errors='ignore').read().split('\n')
-            findings = []
-            for pid, pd in CodeQLScanner.PATTERNS.items():
-                regex = re.compile(pd["regex"], re.I | re.M)
-                for lnum, line in enumerate(lines, 1):
-                    if regex.search(line):
-                        findings.append({
-                            "id": f"codeql/{pid}", "engine": "codeql", "category": "Deep Analysis",
-                            "severity": pd["severity"], "message": pd["message"],
-                            "file": Path(path).name, "line_start": lnum,
-                            "snippet": line.strip()[:150], "cwe": pd["cwe"]
-                        })
-            return ({"findings": findings, "engine": "codeql", "error": None}, time.time() - start)
-        except Exception as e:
-            return ({"findings": [], "engine": "codeql", "error": str(e)}, time.time() - start)
+def scan(path: str):
+    start = time.time()
+    try:
+        # Get scannable content
+        content = FileParser.get_scannable_content(path)
+        lines = content.split('\n')
+        
+        findings = []
+        for pid, pd in CodeQLScanner.PATTERNS.items():
+            regex = re.compile(pd["regex"], re.I | re.M)
+            for lnum, line in enumerate(lines, 1):
+                if regex.search(line):
+                    findings.append({
+                        "id": f"codeql/{pid}", "engine": "codeql", "category": "Deep Analysis",
+                        "severity": pd["severity"], "message": pd["message"],
+                        "file": Path(path).name, "line_start": lnum,
+                        "snippet": line.strip()[:150], "cwe": pd["cwe"]
+                    })
+        return ({"findings": findings, "engine": "codeql", "error": None}, time.time() - start)
+    except Exception as e:
+        return ({"findings": [], "engine": "codeql", "error": str(e)}, time.time() - start)
 
 # AI
 class GeminiAnalyzer:
@@ -386,7 +401,13 @@ async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTa
         if file.filename.endswith('.zip'):
             try:
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    code_extensions = {'.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs', '.jsx', '.tsx'}
+                    code_extensions = {
+    '.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs', 
+    '.jsx', '.tsx', '.rs', '.kt', '.swift',  # Code
+    '.html', '.htm', '.xml', '.svg',  # Web
+    '.pdf', '.docx', '.doc', '.xlsx', '.xls',  # Documents
+    '.txt', '.md', '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg'  # Text
+}
                     
                     for zip_info in zip_ref.filelist:
                         if zip_info.is_dir():

@@ -66,10 +66,19 @@ function App() {
     if (!f) return
     
     const ext = f.name.substring(f.name.lastIndexOf('.'))
-    if (!['.py','.js','.ts','.java','.go','.rb','.zip','.tar','.gz'].includes(ext)) {
-      setError('Invalid file type. Accepted: .py .js .ts .java .go .rb .zip')
-      return
-    }
+const validExts = [
+  '.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs',  // Code
+  '.jsx', '.tsx', '.rs', '.kt', '.swift',  // More code
+  '.html', '.htm', '.xml', '.svg',  // Web
+  '.pdf', '.docx', '.doc', '.xlsx', '.xls',  // Documents
+  '.txt', '.md', '.json', '.yaml', '.yml',  // Text
+  '.zip', '.tar', '.gz'  // Archives
+]
+
+if (!validExts.includes(ext)) {
+  setError('Invalid file type. Accepted: Code, Documents, Web files, Archives')
+  return
+}
     
     if (f.size > 50*1024*1024) {
       setError('File > 50MB')
@@ -409,8 +418,8 @@ function App() {
                 <div className="space-y-4">
                   <div className="relative border-2 border-dashed border-slate-700 rounded-xl p-10 text-center hover:border-blue-500 hover:bg-blue-500/5 group">
                     <input type="file" onChange={handleFile} 
-                           accept=".py,.js,.ts,.java,.go,.rb,.zip,.tar,.gz,.php,.c,.cpp,.cs"
-                           className="absolute inset-0 opacity-0 cursor-pointer" />
+                    accept=".py,.js,.ts,.java,.go,.rb,.php,.c,.cpp,.cs,.html,.pdf,.docx,.xlsx,.zip,.json,.xml"
+                    className="absolute inset-0 opacity-0 cursor-pointer" />
                     
                     <svg className="w-14 h-14 mx-auto mb-4 text-slate-600 group-hover:text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
@@ -427,7 +436,12 @@ function App() {
                     ) : (
                       <div>
                         <p className="text-slate-400 font-medium">Drop file or click to browse</p>
-                        <p className="text-xs text-slate-600 font-mono mt-1">.py .js .ts .java .go .rb .zip</p>
+                        <p className="text-xs text-slate-600 font-mono mt-1">
+  Code • Documents • Web • Archives
+</p>
+<p className="text-xs text-slate-700 mt-1">
+  .py .js .java .pdf .docx .xlsx .html .zip
+</p>
                         <p className="text-xs text-slate-700 mt-2">📦 ZIP files: Extract and scan all code files</p>
                       </div>
                     )}
