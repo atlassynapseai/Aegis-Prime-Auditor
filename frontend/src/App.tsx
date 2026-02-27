@@ -214,7 +214,7 @@ function App() {
               
               <div>
                 <h1 className="text-2xl font-bold bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">ATLAS SYNAPSE</h1>
-                <p className="text-xs text-slate-500 font-medium">SECURITY AUDITOR v2.0</p>
+  <p className="text-xs text-blue-400 font-semibold tracking-wider">Trust Engine for AI Systems</p>
               </div>
             </div>
             

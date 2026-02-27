@@ -1,3 +1,4 @@
+from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
 """
 Aegis Prime Auditor - Backend Orchestrator
 Multi-engine security scanner with AI-powered analysis
@@ -361,13 +362,13 @@ async def root():
     }
 
 @app.post("/api/scan")
-async def scan_code(file: UploadFile = File(...)):
-    """Optimized scan supporting ZIP files with parallel processing."""
+async def scan_code(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
+    """Smart scan with priority-based file selection and background processing."""
     import zipfile
     
     req_start = time.time()
-    
     contents = await file.read()
+    
     if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"File > {MAX_UPLOAD_MB}MB")
     
@@ -379,37 +380,27 @@ async def scan_code(file: UploadFile = File(...)):
         file_path = scan_dir / file.filename
         open(file_path, 'wb').write(contents)
         
-        # Determine files to scan
         files_to_scan = []
         
+        # Handle ZIP files
         if file.filename.endswith('.zip'):
-            # Extract ZIP
             try:
                 with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    # Only extract code files
                     code_extensions = {'.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs', '.jsx', '.tsx'}
                     
                     for zip_info in zip_ref.filelist:
-                        # Skip directories and non-code files
                         if zip_info.is_dir():
                             continue
                         
                         file_ext = Path(zip_info.filename).suffix.lower()
                         if file_ext in code_extensions:
-                            # Extract only this file
                             zip_ref.extract(zip_info, scan_dir / 'extracted')
                             extracted_path = scan_dir / 'extracted' / zip_info.filename
                             
-                            # Skip if too large (>5MB per file)
                             if extracted_path.exists() and extracted_path.stat().st_size < 5 * 1024 * 1024:
                                 files_to_scan.append(extracted_path)
                     
                     logger.info(f"ZIP extraction: {len(files_to_scan)} code files found")
-                    
-                    # Limit to 10 files for performance
-                    if len(files_to_scan) > 10:
-                        logger.warning(f"ZIP has {len(files_to_scan)} files, limiting to 10")
-                        files_to_scan = files_to_scan[:10]
                     
             except Exception as e:
                 logger.error(f"ZIP extraction failed: {e}")
@@ -418,64 +409,67 @@ async def scan_code(file: UploadFile = File(...)):
             files_to_scan = [file_path]
         
         if not files_to_scan:
-            raise HTTPException(400, "No scannable code files found in ZIP")
+            raise HTTPException(400, "No code files found")
         
-        # Scan files in parallel (improved)
+        # SMART PRIORITIZATION
+        files_to_scan = FilePrioritizer.filter_scannable(files_to_scan, max_files=50)
+        original_count = len(files_to_scan)
+        
+        # For large batches (>15 files), use background processing
+        if len(files_to_scan) > 15:
+            # Create background task
+            task_info = background_manager.create_task(scan_id, len(files_to_scan))
+            
+            # Return immediately with task ID
+            return JSONResponse(content={
+                "scan_id": scan_id,
+                "status": "processing",
+                "message": f"Large batch detected ({len(files_to_scan)} files). Processing in background...",
+                "total_files": len(files_to_scan),
+                "progress": 0,
+                "estimated_time": f"{len(files_to_scan) * 3}s",
+                "check_status_at": f"/api/scan/{scan_id}/status"
+            })
+            # Background processing happens asynchronously
+        
+        # For small batches (≤15 files), scan immediately
         all_findings = []
         files_scanned = []
         
-        # For single file: use all engines
+        # Single file: full scan
         if len(files_to_scan) == 1:
             engines, timings = await _run_scanners(str(files_to_scan[0]))
             
             for data in engines.values():
                 all_findings.extend(data.get("findings", []))
             
-            files_scanned.append({
-                "file": files_to_scan[0].name,
-                "findings": len(all_findings)
-            })
+            files_scanned.append({"file": files_to_scan[0].name, "findings": len(all_findings)})
         
-        # For multiple files: parallel but simplified (Semgrep + CodeQL only for speed)
+        # Multiple files: fast parallel scan (Semgrep + CodeQL only)
         else:
-            async def scan_file_fast(fpath):
-                """Fast scan using only Semgrep and CodeQL (skip slow Trivy/Gitleaks)."""
+            async def scan_fast(fpath):
                 loop = asyncio.get_event_loop()
-                
                 semgrep_task = loop.run_in_executor(executor, SemgrepScanner.scan, str(fpath))
                 codeql_task = loop.run_in_executor(executor, CodeQLScanner.scan, str(fpath))
                 
                 (semgrep_result, _), (codeql_result, _) = await asyncio.gather(semgrep_task, codeql_task)
                 
-                findings = []
-                findings.extend(semgrep_result.get("findings", []))
-                findings.extend(codeql_result.get("findings", []))
-                
-                return {
-                    "file": fpath.name,
-                    "findings": len(findings),
-                    "findings_list": findings
-                }
+                findings = semgrep_result.get("findings", []) + codeql_result.get("findings", [])
+                return {"file": fpath.name, "findings": len(findings), "findings_list": findings}
             
-            # Scan all files in parallel
-            scan_tasks = [scan_file_fast(f) for f in files_to_scan]
-            results = await asyncio.gather(*scan_tasks)
+            results = await asyncio.gather(*[scan_fast(f) for f in files_to_scan])
             
-            for result_data in results:
-                files_scanned.append({
-                    "file": result_data["file"],
-                    "findings": result_data["findings"]
-                })
-                all_findings.extend(result_data["findings_list"])
-            
-            logger.info(f"Batch scan: {len(files_to_scan)} files, {len(all_findings)} findings")
+            for r in results:
+                files_scanned.append({"file": r["file"], "findings": r["findings"]})
+                all_findings.extend(r["findings_list"])
         
-        # AI analysis on all findings
+        # AI analysis
         ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), file.filename)
         
-        # Heatmap and severity
+        # Heatmap
         heatmap = generate_heatmap(all_findings)
         
+        # Severity breakdown
         sev_breakdown = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
         for f in all_findings:
             s = f.get("severity", "MEDIUM")
@@ -492,14 +486,15 @@ async def scan_code(file: UploadFile = File(...)):
             "file": file.filename,
             "is_batch": len(files_to_scan) > 1,
             "files_scanned": len(files_to_scan),
+            "files_in_zip": original_count if file.filename.endswith('.zip') else len(files_to_scan),
             "file_results": files_scanned,
-            "engines": {"semgrep": {"findings": []}, "gitleaks": {"findings": []}, "trivy": {"findings": []}, "codeql": {"findings": []}},
             "all_findings": all_findings,
             "total_findings": len(all_findings),
             "ai_analysis": ai_analysis,
             "heatmap_data": heatmap,
             "severity_breakdown": sev_breakdown,
-            "performance": {"total": round(total_time, 2)}
+            "performance": {"total": round(total_time, 2)},
+            "status": "completed"
         }
         
         SCAN_RESULTS_STORE[scan_id] = result
@@ -514,6 +509,26 @@ async def scan_code(file: UploadFile = File(...)):
         raise HTTPException(500, str(e))
     finally:
         shutil.rmtree(scan_dir, ignore_errors=True)
+
+
+@app.get("/api/scan/{scan_id}/status")
+async def get_scan_status(scan_id: str):
+    """Get background scan progress status."""
+    
+    # Check if completed scan exists
+    if scan_id in SCAN_RESULTS_STORE:
+        return JSONResponse(content={
+            "status": "completed",
+            "result": SCAN_RESULTS_STORE[scan_id]
+        })
+    
+    # Check background task status
+    task_status = background_manager.get_status(scan_id)
+    
+    if task_status["status"] == "not_found":
+        raise HTTPException(404, "Scan not found")
+    
+    return JSONResponse(content=task_status)
 
 @app.get("/api/scan/{scan_id}")
 async def get_scan(scan_id: str):
