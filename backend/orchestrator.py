@@ -360,8 +360,8 @@ async def root():
     }
 
 @app.post("/api/scan")
-async def scan_code(files: List[UploadFile] = File(...)):
-    """Multi-file scan supporting individual files or ZIP archives."""
+async def scan_code(file: UploadFile = File(...)):
+    """Smart scan supporting single files and ZIP archives."""
     import zipfile
     
     req_start = time.time()
@@ -371,19 +371,15 @@ async def scan_code(files: List[UploadFile] = File(...)):
     
     try:
         files_to_scan = []
-        uploaded_files = []
         
-        # Process each uploaded file
-        for uploaded_file in files:
-            contents = await uploaded_file.read()
-            
-            if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
-                logger.warning(f"Skipping {uploaded_file.filename} - too large")
-                continue
-            
-            file_path = scan_dir / uploaded_file.filename
-            open(file_path, 'wb').write(contents)
-            uploaded_files.append(uploaded_file.filename)
+        # Save single uploaded file
+        contents = await file.read()
+        
+        if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(413, f"File > {MAX_UPLOAD_MB}MB")
+        
+        file_path = scan_dir / file.filename
+        open(file_path, 'wb').write(contents)
             
             # Handle ZIP extraction
             if uploaded_file.filename.endswith('.zip'):
