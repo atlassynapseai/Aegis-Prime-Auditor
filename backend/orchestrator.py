@@ -130,7 +130,7 @@ class SemgrepScanner:
     @staticmethod
     def scan(path: str):
         start = time.time()
-    try:
+        try:
         # Get scannable content (handles all file types)
         content = FileParser.get_scannable_content(path)
         
