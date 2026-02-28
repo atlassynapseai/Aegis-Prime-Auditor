@@ -1,6 +1,6 @@
 """
-Atlas Synapse Auditor v3.0 - Production Backend
-Multi-file, multi-format security scanner with SBOM, Compliance, PDF Reports
+Atlas Synapse Auditor v3.1 - Production Backend with Malware Detection
+Multi-file, multi-format security scanner + Antivirus-style malware detection
 """
 
 import os
@@ -28,6 +28,16 @@ from file_parsers import FileParser
 from sbom_compliance import SBOMGenerator, ComplianceMapper
 from pdf_generator import ReportGenerator
 
+# Malware detection imports
+try:
+    from malware_detection.signature_scanner import MalwareScanner as MalwareScannerEngine, YARAScanner
+    from malware_detection.heuristic_analyzer import HeuristicAnalyzer, EntropyAnalyzer
+    MALWARE_DETECTION_AVAILABLE = True
+except ImportError:
+    MALWARE_DETECTION_AVAILABLE = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning("⚠️ Malware detection modules not found")
+
 # Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -39,8 +49,8 @@ logger = logging.getLogger(__name__)
 # App
 app = FastAPI(
     title="Atlas Synapse Auditor",
-    version="3.0.0",
-    description="Trust Engine for AI Systems"
+    version="3.1.0",
+    description="Trust Engine for AI Systems + Malware Detection"
 )
 
 app.add_middleware(
@@ -54,6 +64,7 @@ app.add_middleware(
 # Config
 GEMINI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")  # Optional
 SCAN_TIMEOUT = int(os.getenv("SCAN_TIMEOUT_SECONDS", "120"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
 
@@ -66,6 +77,15 @@ if GEMINI_API_KEY:
     except Exception as e:
         logger.error(f"❌ Gemini init failed: {e}")
 
+# Initialize malware scanner
+malware_scanner = None
+if MALWARE_DETECTION_AVAILABLE:
+    try:
+        malware_scanner = MalwareScannerEngine(VIRUSTOTAL_API_KEY)
+        logger.info(f"🦠 Malware detection: ✅ Enabled {'(with VirusTotal)' if VIRUSTOTAL_API_KEY else '(YARA only)'}")
+    except Exception as e:
+        logger.error(f"❌ Malware scanner init failed: {e}")
+
 SCAN_RESULTS_STORE: Dict[str, Any] = {}
 UPLOAD_DIR = Path("/tmp/atlas_uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -77,7 +97,7 @@ executor = ThreadPoolExecutor(max_workers=4)
 class PerformanceMetrics:
     def __init__(self):
         self.scan_times = []
-        self.engine_times = {'semgrep': [], 'gitleaks': [], 'trivy': [], 'codeql': [], 'ai': []}
+        self.engine_times = {'semgrep': [], 'gitleaks': [], 'trivy': [], 'codeql': [], 'ai': [], 'malware': []}
     
     def record(self, total: float, engines: Dict[str, float]):
         self.scan_times.append(total)
@@ -266,11 +286,12 @@ class EnhancedScanner:
             all_findings = codeql_findings + specialized_findings
             
             elapsed = time.time() - start
-            logger.info(f"Enhanced scan: {elapsed:.2f}s, {len(all_findings)} findings ({len(codeql_findings)} CodeQL + {len(specialized_findings)} specialized)")
+            logger.info(f"Enhanced scan: {elapsed:.2f}s, {len(all_findings)} findings")
             return ({"findings": all_findings, "engine": "enhanced", "error": None}, elapsed)
             
         except Exception as e:
             return ({"findings": [], "engine": "enhanced", "error": str(e)}, time.time() - start)
+
 # AI
 class GeminiAnalyzer:
     @staticmethod
@@ -341,7 +362,7 @@ Return JSON:
         }
 
 def generate_heatmap(findings):
-    categories = ["SAST", "Secrets", "SCA", "Deep Analysis"]
+    categories = ["SAST", "Secrets", "SCA", "Deep Analysis", "Malware Detection"]
     severities = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
     matrix = {f"{c}_{s}": {"category": c, "severity": s, "count": 0, "risk_weight": 0.0} 
               for c in categories for s in severities}
@@ -375,19 +396,24 @@ async def _run_scanners(path: str):
 async def root():
     return {
         "service": "Atlas Synapse Auditor",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "status": "operational",
-        "tagline": "Trust Engine for AI Systems",
+        "tagline": "Trust Engine for AI Systems + Malware Detection",
         "engines": {
             "semgrep": shutil.which("semgrep") is not None,
             "gitleaks": shutil.which("gitleaks") is not None,
             "trivy": shutil.which("trivy") is not None,
             "codeql": True,
-            "gemini_ai": gemini_client is not None
+            "gemini_ai": gemini_client is not None,
+            "malware_detection": malware_scanner is not None,
+            "yara": MALWARE_DETECTION_AVAILABLE,
+            "virustotal": bool(VIRUSTOTAL_API_KEY),
+            "heuristic_analysis": MALWARE_DETECTION_AVAILABLE
         },
         "features": {
             "multi_file_upload": True,
             "multi_format_support": True,
+            "malware_detection": True,
             "sbom_generation": True,
             "compliance_mapping": True,
             "pdf_reports": True,
@@ -398,7 +424,7 @@ async def root():
 
 @app.post("/api/scan")
 async def scan_code(files: List[UploadFile] = File(...)):
-    """Multi-file, multi-format scan with smart prioritization."""
+    """Multi-file scan with code vulnerability + malware detection."""
     import zipfile
     
     req_start = time.time()
@@ -410,7 +436,7 @@ async def scan_code(files: List[UploadFile] = File(...)):
         files_to_scan = []
         uploaded_filenames = []
         
-        # Process each uploaded file
+        # Process uploaded files
         for uploaded_file in files:
             contents = await uploaded_file.read()
             
@@ -428,7 +454,7 @@ async def scan_code(files: List[UploadFile] = File(...)):
                     with zipfile.ZipFile(file_path, 'r') as zip_ref:
                         code_exts = {'.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs',
                                     '.jsx', '.tsx', '.html', '.htm', '.xml', '.pdf', '.docx', '.xlsx',
-                                    '.txt', '.md', '.json', '.yaml', '.yml'}
+                                    '.txt', '.md', '.json', '.yaml', '.yml', '.exe', '.dll', '.sh'}
                         
                         for zip_info in zip_ref.filelist:
                             if zip_info.is_dir():
@@ -450,7 +476,7 @@ async def scan_code(files: List[UploadFile] = File(...)):
         if not files_to_scan:
             raise HTTPException(400, "No scannable files found")
         
-        # Smart prioritization (limit to 15 for speed)
+        # Smart prioritization
         files_to_scan = FilePrioritizer.filter_scannable(files_to_scan, max_files=15)
         
         logger.info(f"Scanning {len(files_to_scan)} files from {len(uploaded_filenames)} uploads")
@@ -458,15 +484,38 @@ async def scan_code(files: List[UploadFile] = File(...)):
         # Scan all files
         all_findings = []
         files_scanned = []
+        malware_stats = {"total_detections": 0, "yara_hits": 0, "heuristic_flags": 0}
         
         if len(files_to_scan) == 1:
             # Single file: full scan
             engines, timings = await _run_scanners(str(files_to_scan[0]))
             for data in engines.values():
                 all_findings.extend(data.get("findings", []))
+            
+            # Add malware detection
+            if malware_scanner:
+                try:
+                    malware_result = malware_scanner.scan_file(str(files_to_scan[0]))
+                    all_findings.extend(malware_result.get("findings", []))
+                    malware_stats["total_detections"] = malware_result.get("total_detections", 0)
+                    malware_stats["yara_hits"] = malware_result.get("scanners_used", {}).get("yara", 0)
+                    logger.info(f"🦠 Malware scan: {malware_result['total_detections']} detections")
+                except Exception as e:
+                    logger.error(f"Malware scan error: {e}")
+            
+            # Add heuristic analysis
+            if MALWARE_DETECTION_AVAILABLE:
+                try:
+                    heuristic_result = HeuristicAnalyzer.scan(str(files_to_scan[0]))
+                    all_findings.extend(heuristic_result.get("findings", []))
+                    malware_stats["heuristic_flags"] = heuristic_result.get("total_indicators", 0)
+                    logger.info(f"🔍 Heuristic: {heuristic_result['total_indicators']} indicators")
+                except Exception as e:
+                    logger.error(f"Heuristic analysis error: {e}")
+            
             files_scanned.append({"file": files_to_scan[0].name, "findings": len(all_findings)})
         else:
-            # Multiple files: fast scan (Semgrep + CodeQL)
+            # Multiple files: fast scan
             async def scan_fast(fpath):
                 loop = asyncio.get_event_loop()
                 s_task = loop.run_in_executor(executor, SemgrepScanner.scan, str(fpath))
@@ -475,6 +524,16 @@ async def scan_code(files: List[UploadFile] = File(...)):
                 (s_result, _), (e_result, _) = await asyncio.gather(s_task, e_task)
                 
                 findings = s_result.get("findings", []) + e_result.get("findings", [])
+                
+                # Add malware detection for each file
+                if malware_scanner:
+                    try:
+                        malware_result = malware_scanner.scan_file(str(fpath))
+                        findings.extend(malware_result.get("findings", []))
+                        logger.info(f"🦠 {fpath.name}: {malware_result['total_detections']} malware detections")
+                    except Exception as e:
+                        logger.error(f"Malware scan error for {fpath.name}: {e}")
+                
                 return {"file": fpath.name, "findings": len(findings), "findings_list": findings}
             
             results = await asyncio.gather(*[scan_fast(f) for f in files_to_scan])
@@ -483,14 +542,14 @@ async def scan_code(files: List[UploadFile] = File(...)):
                 files_scanned.append({"file": r["file"], "findings": r["findings"]})
                 all_findings.extend(r["findings_list"])
         
-        # AI
+        # AI analysis
         file_desc = ", ".join(uploaded_filenames) if len(uploaded_filenames) <= 3 else f"{uploaded_filenames[0]} + {len(uploaded_filenames)-1} more"
         ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), file_desc)
         
         # Heatmap
         heatmap = generate_heatmap(all_findings)
         
-        # Severity
+        # Severity breakdown
         sev_breakdown = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
         for f in all_findings:
             s = f.get("severity", "MEDIUM")
@@ -515,14 +574,16 @@ async def scan_code(files: List[UploadFile] = File(...)):
             "ai_analysis": ai_analysis,
             "heatmap_data": heatmap,
             "severity_breakdown": sev_breakdown,
+            "malware_detection": malware_stats if malware_scanner else None,
             "performance": {"total": round(total_time, 2)},
             "status": "completed",
             "engines": {"semgrep": {"findings": []}, "gitleaks": {"findings": []}, 
-                       "trivy": {"findings": []}, "codeql": {"findings": []}}
+                       "trivy": {"findings": []}, "codeql": {"findings": []},
+                       "malware": {"findings": []}}
         }
         
         SCAN_RESULTS_STORE[scan_id] = result
-        logger.info(f"✅ Multi-file scan {scan_id}: {len(uploaded_filenames)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
+        logger.info(f"✅ Scan {scan_id}: {len(uploaded_filenames)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
         
         return JSONResponse(content=result)
         
@@ -613,13 +674,15 @@ if __name__ == "__main__":
     port = int(os.getenv("AEGIS_PORT", "10000"))
     
     print("="*80)
-    print("ATLAS SYNAPSE AUDITOR v3.0 - PRODUCTION")
+    print("ATLAS SYNAPSE AUDITOR v3.1 - MALWARE DETECTION EDITION")
     print("="*80)
     print(f"🚀 http://{host}:{port}")
     print(f"📊 Docs: http://{host}:{port}/docs")
     print(f"🔧 Gemini: {'✅' if gemini_client else '❌'}")
-    print(f"📁 Multi-File: ✅")
-    print(f"📋 Multi-Format: PDF, DOCX, XLSX, HTML, Media")
+    print(f"🦠 Malware Detection: {'✅' if malware_scanner else '❌'}")
+    print(f"🔍 YARA Rules: {'✅' if MALWARE_DETECTION_AVAILABLE else '❌'}")
+    print(f"☁️  VirusTotal: {'✅' if VIRUSTOTAL_API_KEY else '❌ (optional)'}")
+    print(f"📁 Multi-File + Multi-Format: ✅")
     print(f"🎯 Trust Engine for AI Systems")
     print("="*80)
     
