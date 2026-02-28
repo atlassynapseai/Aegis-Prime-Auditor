@@ -3,8 +3,16 @@ import './App.css'
 
 interface Finding {
   id: string; engine: string; category: string; severity: string; message: string
-  file: string; line_start: number; snippet?: string; cwe?: string | string[]
+  file: string; line_start?: number; snippet?: string; cwe?: string | string[]
   package?: string; cve?: string
+  rule?: string; hash?: string; detection_ratio?: string  // Malware-specific
+}
+
+interface MalwareStats {
+  total_detections: number
+  yara_hits: number
+  heuristic_flags: number
+  virustotal_detections?: number
 }
 
 interface ScanResult {
@@ -15,6 +23,7 @@ interface ScanResult {
   heatmap_data: Array<{ category: string; severity: string; count: number; normalized: number }>
   all_findings: Finding[]
   severity_breakdown: Record<string, number>
+  malware_detection?: MalwareStats | null
   engines: any
   status?: string
 }
@@ -43,7 +52,7 @@ function App() {
   const [showHistory, setShowHistory] = useState(false)
   const [showCompliance, setShowCompliance] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
-  const [toast, setToast] = useState<{msg: string; type: 'success'|'error'} | null>(null)
+  const [toast, setToast] = useState<{msg: string; type: 'success'|'error'|'warning'} | null>(null)
 
   const BACKEND = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
@@ -60,9 +69,9 @@ function App() {
     }
   }, [result])
 
-  const showToast = (msg: string, type: 'success'|'error') => {
+  const showToast = (msg: string, type: 'success'|'error'|'warning') => {
     setToast({ msg, type })
-    setTimeout(() => setToast(null), 4000)
+    setTimeout(() => setToast(null), 5000)
   }
 
   const getFileIcon = (filename: string) => {
@@ -70,6 +79,7 @@ function App() {
     if (['.py'].includes(ext)) return '🐍'
     if (['.js', '.ts', '.jsx', '.tsx'].includes(ext)) return '⚡'
     if (['.java'].includes(ext)) return '☕'
+    if (['.exe', '.dll'].includes(ext)) return '⚙️'
     if (['.zip', '.tar', '.gz'].includes(ext)) return '📦'
     if (['.pdf'].includes(ext)) return '📄'
     if (['.docx', '.doc'].includes(ext)) return '📝'
@@ -85,13 +95,13 @@ function App() {
     const files = e.target.files
     if (!files || files.length === 0) return
     
-    // Validate all files
     const validExts = [
       '.py', '.js', '.ts', '.java', '.go', '.rb', '.php', '.c', '.cpp', '.cs',
       '.jsx', '.tsx', '.rs', '.kt', '.swift',
       '.html', '.htm', '.xml', '.svg',
       '.pdf', '.docx', '.doc', '.xlsx', '.xls',
       '.txt', '.md', '.json', '.yaml', '.yml',
+      '.exe', '.dll', '.sh',
       '.mp3', '.mp4', '.wav', '.avi', '.mov',
       '.jpg', '.jpeg', '.png', '.gif',
       '.zip', '.tar', '.gz'
@@ -119,12 +129,14 @@ function App() {
     if (files.length === 1) {
       const f = files[0]
       if (f.name.endsWith('.zip')) {
-        showToast(`📦 ZIP: ${f.name} - Will extract and scan all code files`, 'success')
+        showToast(`📦 ZIP: ${f.name} - Will extract and scan`, 'success')
+      } else if (f.name.endsWith('.exe') || f.name.endsWith('.dll')) {
+        showToast(`⚙️ Executable: ${f.name} - Malware detection enabled`, 'warning')
       } else {
         showToast(`${getFileIcon(f.name)} Selected: ${f.name}`, 'success')
       }
     } else {
-      showToast(`📁 ${files.length} files selected for batch scanning`, 'success')
+      showToast(`📁 ${files.length} files selected`, 'success')
     }
   }
 
@@ -161,7 +173,6 @@ function App() {
     try {
       const fd = new FormData()
       
-      // Append all selected files
       for (let i = 0; i < selectedFiles.length; i++) {
         fd.append('files', selectedFiles[i])
       }
@@ -176,7 +187,7 @@ function App() {
       
       if (!resp.ok) {
         const errorText = await resp.text()
-        throw new Error(`Scan failed: ${resp.statusText} - ${errorText}`)
+        throw new Error(`Scan failed: ${resp.statusText}`)
       }
       
       const data = await resp.json()
@@ -189,6 +200,11 @@ function App() {
       setScanProgress(100)
       setResult(data)
       
+      // Check for malware
+      if (data.malware_detection && data.malware_detection.total_detections > 0) {
+        showToast(`🦠 MALWARE DETECTED: ${data.malware_detection.total_detections} threats found!`, 'warning')
+      }
+      
       try {
         const compResp = await fetch(`${BACKEND}/api/scan/${data.scan_id}/compliance`)
         if (compResp.ok) setCompliance(await compResp.json())
@@ -198,9 +214,9 @@ function App() {
       if (fileCount > 1) {
         showToast(`✅ Multi-file scan: ${fileCount} files, ${data.total_findings} findings`, 'success')
       } else if (data.is_batch) {
-        showToast(`✅ Batch scan: ${data.files_scanned} files, ${data.total_findings} findings`, 'success')
+        showToast(`✅ Batch: ${data.files_scanned} files, ${data.total_findings} findings`, 'success')
       } else {
-        showToast(`✅ Scan complete: ${data.total_findings} findings`, 'success')
+        showToast(`✅ Complete: ${data.total_findings} findings`, 'success')
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Scan failed'
@@ -221,13 +237,11 @@ function App() {
         const resp = await fetch(`${BACKEND}/api/scan/${scanId}/status`)
         const status = await resp.json()
         
-        if (status.progress) {
-          setScanProgress(status.progress)
-        }
+        if (status.progress) setScanProgress(status.progress)
         
         if (status.status === 'completed') {
           setResult(status.result)
-          showToast('Background scan completed!', 'success')
+          showToast('Scan completed!', 'success')
           break
         } else if (status.status === 'failed') {
           setError(status.error || 'Scan failed')
@@ -277,7 +291,7 @@ function App() {
   const exportPDF = () => {
     if (!result) return
     window.open(`${BACKEND}/api/scan/${result.scan_id}/report/html`, '_blank')
-    showToast('📄 Opening report (Ctrl+P to save)', 'success')
+    showToast('📄 Opening report', 'success')
   }
 
   const getColor = (s: string) => {
@@ -300,15 +314,18 @@ function App() {
     return true
   }) || []
 
+  // Check if malware was detected
+  const hasMalware = result?.malware_detection && result.malware_detection.total_detections > 0
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 animate-gradient">
       {toast && (
         <div className="fixed top-4 right-4 z-50 px-6 py-4 rounded-xl shadow-2xl animate-slide-in hover-glow"
-             style={{backgroundColor: toast.type==='success' ? '#10b981' : '#ef4444', color: 'white'}}>
+             style={{backgroundColor: toast.type==='success' ? '#10b981' : toast.type==='warning' ? '#f59e0b' : '#ef4444', color: 'white'}}>
           <div className="flex gap-3 items-center">
             <svg className="w-5 h-5 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} 
-                    d={toast.type==='success' ? "M5 13l4 4L19 7" : "M6 18L18 6M6 6l12 12"} />
+                    d={toast.type==='success' ? "M5 13l4 4L19 7" : toast.type==='warning' ? "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" : "M6 18L18 6M6 6l12 12"} />
             </svg>
             <span className="font-medium">{toast.msg}</span>
           </div>
@@ -343,33 +360,26 @@ function App() {
                 <>
                   <button 
                     onClick={() => setShowCompliance(!showCompliance)}
-                    className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium flex items-center gap-2 hover-lift transition-smooth tooltip"
-                    data-tooltip="View compliance frameworks">
+                    className="px-3 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium flex items-center gap-2 hover-lift transition-smooth"
+                    data-tooltip="View compliance">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                     </svg>
                     Compliance
                   </button>
                   
-                  <div className="hidden md:flex gap-4 text-sm">
-                    {[{n:'Semgrep',c:result.engines.semgrep?.findings?.length||0},
-                      {n:'Gitleaks',c:result.engines.gitleaks?.findings?.length||0},
-                      {n:'Trivy',c:result.engines.trivy?.findings?.length||0},
-                      {n:'CodeQL',c:result.engines.codeql?.findings?.length||0}].map(e => (
-                      <div key={e.n} className="flex gap-2 items-center hover-scale transition-smooth">
-                        <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow"></div>
-                        <span className="text-slate-400">{e.n}</span>
-                        <span className="text-white font-mono font-bold badge-pulse">{e.c}</span>
-                      </div>
-                    ))}
-                  </div>
+                  {hasMalware && (
+                    <div className="px-3 py-1.5 bg-red-600 text-white rounded-lg text-sm font-bold flex items-center gap-2 animate-glow">
+                      <span className="text-lg">🦠</span>
+                      <span>MALWARE: {result.malware_detection!.total_detections}</span>
+                    </div>
+                  )}
                 </>
               )}
               
               <button 
                 onClick={() => setShowHistory(!showHistory)} 
-                className="p-2 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-smooth tooltip hover-scale"
-                data-tooltip="Scan history">
+                className="p-2 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-smooth hover-scale">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
@@ -382,34 +392,51 @@ function App() {
       <div className="container mx-auto px-6 py-8">
         {result && !showHistory && !showCompliance && (
           <>
-            {result.uploaded_files && result.uploaded_files.length > 1 && (
-              <div className="mb-4 p-4 bg-blue-900/20 border-2 border-blue-500 rounded-xl animate-fade-in hover-lift transition-smooth">
-                <div className="flex items-center gap-3">
-                  <svg className="w-5 h-5 text-blue-400 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                  <div>
-                    <p className="text-blue-300 font-medium">
-                      📁 Multi-File Scan: {result.uploaded_files.length} files uploaded
-                    </p>
-                    <p className="text-blue-400 text-xs mt-1">
-                      Files: {result.uploaded_files.slice(0, 3).join(', ')}
-                      {result.uploaded_files.length > 3 && ` +${result.uploaded_files.length - 3} more`}
+            {hasMalware && (
+              <div className="mb-4 p-5 bg-red-900/30 border-2 border-red-500 rounded-xl animate-fade-in hover-lift transition-smooth">
+                <div className="flex items-start gap-4">
+                  <div className="text-4xl animate-bounce">🦠</div>
+                  <div className="flex-1">
+                    <h3 className="text-red-300 font-bold text-lg mb-2">
+                      MALWARE DETECTED
+                    </h3>
+                    <div className="grid grid-cols-3 gap-4 text-sm">
+                      <div>
+                        <span className="text-red-400">YARA Signatures:</span>
+                        <span className="ml-2 text-white font-bold">{result.malware_detection!.yara_hits}</span>
+                      </div>
+                      <div>
+                        <span className="text-red-400">Heuristic Flags:</span>
+                        <span className="ml-2 text-white font-bold">{result.malware_detection!.heuristic_flags}</span>
+                      </div>
+                      <div>
+                        <span className="text-red-400">Total Threats:</span>
+                        <span className="ml-2 text-white font-bold">{result.malware_detection!.total_detections}</span>
+                      </div>
+                    </div>
+                    <p className="text-red-300 text-xs mt-3">
+                      ⚠️ This file contains malicious patterns. Do not execute.
                     </p>
                   </div>
                 </div>
               </div>
             )}
             
-            {result.is_batch && !result.uploaded_files && (
+            {result.uploaded_files && result.uploaded_files.length > 1 && (
               <div className="mb-4 p-4 bg-blue-900/20 border-2 border-blue-500 rounded-xl animate-fade-in hover-lift transition-smooth">
                 <div className="flex items-center gap-3">
                   <svg className="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
-                  <p className="text-blue-300 font-medium">
-                    📦 ZIP Archive: {result.files_scanned} code files extracted and scanned
-                  </p>
+                  <div>
+                    <p className="text-blue-300 font-medium">
+                      📁 Multi-File Scan: {result.uploaded_files.length} files
+                    </p>
+                    <p className="text-blue-400 text-xs mt-1">
+                      {result.uploaded_files.slice(0, 3).join(', ')}
+                      {result.uploaded_files.length > 3 && ` +${result.uploaded_files.length - 3} more`}
+                    </p>
+                  </div>
                 </div>
               </div>
             )}
@@ -418,7 +445,7 @@ function App() {
                  style={{backgroundColor: `${getColor(result.ai_analysis.risk_level)}08`, borderColor: `${getColor(result.ai_analysis.risk_level)}40`}}>
               <div className="flex justify-between gap-8">
                 <div className="flex-1">
-                  <div className="flex gap-3 mb-4 items-center">
+                  <div className="flex gap-3 mb-4 items-center flex-wrap">
                     <h2 className="text-4xl font-black text-white">
                       RISK: {result.ai_analysis.risk_score}<span className="text-slate-500">/100</span>
                     </h2>
@@ -441,25 +468,19 @@ function App() {
                 </div>
                 
                 <div className="flex flex-col gap-2">
-                  <button onClick={exportJSON} 
-                          className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center hover-lift transition-smooth tooltip"
-                          data-tooltip="Export as JSON">
+                  <button onClick={exportJSON} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center hover-lift transition-smooth">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3" />
                     </svg>
                     JSON
                   </button>
-                  <button onClick={exportSBOM} 
-                          className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center hover-lift transition-smooth tooltip"
-                          data-tooltip="Software Bill of Materials">
+                  <button onClick={exportSBOM} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center hover-lift transition-smooth">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586" />
                     </svg>
                     SBOM
                   </button>
-                  <button onClick={exportPDF} 
-                          className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center hover-lift transition-smooth tooltip"
-                          data-tooltip="Executive PDF report">
+                  <button onClick={exportPDF} className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-medium flex gap-2 items-center hover-lift transition-smooth">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 21h10a2 2 0 002-2V9.414" />
                     </svg>
@@ -471,7 +492,7 @@ function App() {
           </>
         )}
 
-        {showCompliance && compliance && (
+{showCompliance && compliance && (
           <div className="mb-8 animate-fade-in">
             <div className="flex justify-between mb-6">
               <h2 className="text-2xl font-bold text-white">Compliance Assessment</h2>
@@ -574,7 +595,7 @@ function App() {
                       type="file" 
                       multiple
                       onChange={handleFile} 
-                      accept=".py,.js,.ts,.java,.go,.rb,.php,.c,.cpp,.cs,.html,.pdf,.docx,.xlsx,.zip,.json,.xml,.mp3,.mp4,.wav"
+                      accept=".py,.js,.ts,.java,.go,.rb,.php,.c,.cpp,.cs,.html,.pdf,.docx,.xlsx,.zip,.json,.xml,.exe,.dll,.sh"
                       className="absolute inset-0 opacity-0 cursor-pointer" 
                     />
                     
@@ -613,25 +634,19 @@ function App() {
                                 </span>
                               )}
                             </div>
-                            <p className="text-xs text-slate-500 mt-2">
-                              Total size: {(Array.from(selectedFiles).reduce((sum, f) => sum + f.size, 0) / 1024).toFixed(1)} KB
-                            </p>
                           </>
                         )}
                       </div>
                     ) : (
                       <div>
                         <p className="text-slate-400 font-medium mb-2">
-                          {isDragging ? '📂 Drop files here' : 'Drop files or click to browse'}
+                          {isDragging ? '📂 Drop files' : 'Drop files or click'}
                         </p>
                         <p className="text-xs text-slate-600 font-mono mt-1">
-                          Select multiple files with Ctrl+Click or Shift+Click
-                        </p>
-                        <p className="text-xs text-slate-600 mt-1">
-                          Code • Documents • Web • Media • Archives
+                          Ctrl+Click for multiple • Now with malware detection
                         </p>
                         <div className="mt-3 flex flex-wrap gap-1 justify-center">
-                          {['🐍.py', '⚡.js', '☕.java', '📄.pdf', '📝.docx', '📊.xlsx', '🌐.html', '📦.zip'].map(t => (
+                          {['🐍.py', '⚡.js', '☕.java', '📄.pdf', '📦.zip', '🦠.exe'].map(t => (
                             <span key={t} className="text-xs text-slate-700 px-2 py-1 bg-slate-800/30 rounded hover-scale transition-smooth">
                               {t}
                             </span>
@@ -698,6 +713,25 @@ function App() {
                       </div>
                     ))}
                   </div>
+                  
+                  {hasMalware && (
+                    <div className="mt-4 pt-4 border-t border-slate-700">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="text-2xl">🦠</span>
+                        <h4 className="text-white font-bold text-sm">Malware Detection</h4>
+                      </div>
+                      <div className="space-y-2 text-xs">
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">YARA Rules:</span>
+                          <span className="text-red-400 font-bold">{result.malware_detection!.yara_hits}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">Heuristics:</span>
+                          <span className="text-orange-400 font-bold">{result.malware_detection!.heuristic_flags}</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -710,8 +744,6 @@ function App() {
                       RISK HEATMAP
                       <span className="ml-4 text-sm font-normal text-slate-500">
                         {result.total_findings} findings
-                        {result.uploaded_files && result.uploaded_files.length > 1 && ` across ${result.uploaded_files.length} files`}
-                        {result.is_batch && !result.uploaded_files && ` from ${result.files_scanned} extracted files`}
                       </span>
                     </h3>
 
@@ -725,7 +757,7 @@ function App() {
                         </tr>
                       </thead>
                       <tbody>
-                        {['SAST','Secrets','SCA','Deep Analysis'].map((cat, idx) => (
+                        {['SAST','Secrets','SCA','Deep Analysis','Malware Detection'].map((cat, idx) => (
                           <tr key={cat} className="border-t border-slate-800">
                             <td className="p-3 text-sm text-slate-400 font-bold">{cat}</td>
                             {['CRITICAL','HIGH','MEDIUM','LOW'].map(sev => {
@@ -741,8 +773,7 @@ function App() {
                                   }}
                                   className="p-3 text-center cursor-pointer hover:ring-2 hover:ring-blue-400 hover:scale-105 rounded-lg transition-all"
                                   style={{
-                                    backgroundColor: count > 0 ? `${getColor(sev)}${Math.floor((cell?.normalized||0)*180).toString(16).padStart(2,'0')}` : '#1e293b',
-                                    animationDelay: `${idx * 100}ms`
+                                    backgroundColor: count > 0 ? `${getColor(sev)}${Math.floor((cell?.normalized||0)*180).toString(16).padStart(2,'0')}` : '#1e293b'
                                   }}>
                                   <span className="text-white font-black text-lg">{count}</span>
                                 </td>
@@ -790,19 +821,21 @@ function App() {
                       ) : (
                         filtered.map((f,i) => {
                           const isExp = expanded === f.id+i
+                          const isMalware = f.category === 'Malware Detection'
+                          
                           return (
                             <div 
                               key={i} 
-                              className="rounded-xl border-2 cursor-pointer hover-lift transition-all"
+                              className={`rounded-xl border-2 cursor-pointer hover-lift transition-all ${isMalware ? 'animate-glow' : ''}`}
                               style={{
-                                backgroundColor: `${getColor(f.severity)}08`, 
-                                borderColor: `${getColor(f.severity)}40`,
-                                animationDelay: `${i * 50}ms`
+                                backgroundColor: isMalware ? '#7f1d1d20' : `${getColor(f.severity)}08`, 
+                                borderColor: isMalware ? '#dc2626' : `${getColor(f.severity)}40`
                               }}
                               onClick={() => setExpanded(isExp ? null : f.id+i)}>
                               <div className="p-5">
                                 <div className="flex justify-between mb-3">
                                   <div className="flex gap-2 flex-wrap items-center">
+                                    {isMalware && <span className="text-xl">🦠</span>}
                                     <span className="px-3 py-1 rounded-lg text-xs font-black hover-glow transition-smooth" 
                                           style={{backgroundColor: getColor(f.severity), color: 'white'}}>
                                       {f.severity}
@@ -811,18 +844,35 @@ function App() {
                                       {f.engine}
                                     </span>
                                     {f.cwe && (
-                                      <span className="text-xs text-slate-500 font-mono hover-scale transition-smooth">
+                                      <span className="text-xs text-slate-500 font-mono">
                                         {Array.isArray(f.cwe) ? f.cwe[0] : f.cwe}
+                                      </span>
+                                    )}
+                                    {f.rule && (
+                                      <span className="px-2 py-1 bg-red-900/30 text-red-300 rounded text-xs">
+                                        {f.rule}
                                       </span>
                                     )}
                                   </div>
                                   <span className="text-xs text-slate-500 font-mono whitespace-nowrap">
                                     <span className="text-lg mr-1">{getFileIcon(f.file)}</span>
-                                    {f.file}:{f.line_start}
+                                    {f.file}{f.line_start ? `:${f.line_start}` : ''}
                                   </span>
                                 </div>
                                 
                                 <p className="text-slate-200 mb-3 leading-relaxed">{f.message}</p>
+                                
+                                {f.detection_ratio && (
+                                  <p className="text-xs text-orange-400 mb-2">
+                                    VirusTotal: {f.detection_ratio} engines flagged this file
+                                  </p>
+                                )}
+                                
+                                {f.hash && (
+                                  <p className="text-xs text-slate-600 font-mono mb-2">
+                                    Hash: {f.hash.substring(0, 16)}...
+                                  </p>
+                                )}
                                 
                                 {f.snippet && (
                                   <pre className="text-xs bg-slate-950/50 p-3 rounded-lg border border-slate-800 text-slate-400 font-mono overflow-x-auto hover:bg-slate-950/70 transition-all">
@@ -857,8 +907,8 @@ function App() {
                     </svg>
                   </div>
                   <h3 className="text-xl font-bold text-slate-300 mb-2">Ready to Scan</h3>
-                  <p className="text-slate-500 mb-1">Upload code, documents, or archives</p>
-                  <p className="text-xs text-slate-600">Select multiple files for batch analysis</p>
+                  <p className="text-slate-500 mb-1">Code vulnerabilities + Malware detection</p>
+                  <p className="text-xs text-slate-600">25+ formats • YARA • Heuristics • AI Analysis</p>
                 </div>
               )}
 
@@ -872,12 +922,10 @@ function App() {
                   <p className="text-slate-400 mb-2">
                     {selectedFiles && selectedFiles.length > 1 
                       ? `Analyzing ${selectedFiles.length} files...`
-                      : selectedFiles && selectedFiles[0]?.name.endsWith('.zip')
-                      ? 'Extracting and analyzing...'
-                      : 'Running 4 security engines + AI'}
+                      : 'Code vulnerabilities + Malware detection'}
                   </p>
                   {scanProgress > 0 && (
-                    <p className="text-blue-400 font-mono text-sm">{scanProgress}% complete</p>
+                    <p className="text-blue-400 font-mono text-sm">{scanProgress}%</p>
                   )}
                 </div>
               )}
@@ -912,21 +960,15 @@ function App() {
                         .then(setCompliance)
                         .catch(() => {})
                     }}
-                    className="bg-slate-900/50 rounded-xl border border-slate-800 p-6 hover:border-blue-500 cursor-pointer hover-lift transition-smooth"
-                    style={{animationDelay: `${idx * 50}ms`}}>
+                    className="bg-slate-900/50 rounded-xl border border-slate-800 p-6 hover:border-blue-500 cursor-pointer hover-lift transition-smooth">
                     <div className="flex justify-between">
                       <div className="flex-1">
                         <div className="flex gap-3 mb-2 items-center">
                           <span className="text-2xl">{getFileIcon(s.file)}</span>
                           <h3 className="text-white font-semibold">{s.file}</h3>
-                          {s.uploaded_files && s.uploaded_files.length > 1 && (
-                            <span className="px-2 py-0.5 bg-blue-600 text-white rounded text-xs font-bold">
-                              {s.uploaded_files.length} files
-                            </span>
-                          )}
-                          {s.is_batch && !s.uploaded_files && (
-                            <span className="px-2 py-0.5 bg-blue-600 text-white rounded text-xs font-bold">
-                              {s.files_scanned} files
+                          {s.malware_detection && s.malware_detection.total_detections > 0 && (
+                            <span className="px-2 py-1 bg-red-600 text-white rounded text-xs font-bold flex items-center gap-1">
+                              🦠 {s.malware_detection.total_detections}
                             </span>
                           )}
                         </div>
@@ -949,10 +991,10 @@ function App() {
         <div className="container mx-auto px-6 py-6">
           <div className="flex items-center justify-between text-sm text-slate-500">
             <div className="hover-scale transition-smooth">
-              Powered by Semgrep • Gitleaks • Trivy • Gemini AI
+              Powered by Semgrep • Gitleaks • Trivy • YARA • Gemini AI
             </div>
             <div className="hover-scale transition-smooth">
-              Built by <span className="text-blue-400 font-semibold">Atlas Synapse LLC</span>
+              <span className="text-blue-400 font-semibold">Atlas Synapse LLC</span>
             </div>
           </div>
         </div>
