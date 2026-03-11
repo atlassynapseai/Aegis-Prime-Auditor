@@ -56,16 +56,12 @@ function App() {
 
   const BACKEND = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
-  useEffect(() => {
-    const saved = localStorage.getItem('atlas_history')
-    if (saved) try { setHistory(JSON.parse(saved)) } catch {}
-  }, [])
+  const HOMEPAGE = 'https://atlassynapseai.com'
 
+  // Keep scan history in memory only (no localStorage)
   useEffect(() => {
     if (result && result.status === 'completed' && !history.find(s => s.scan_id === result.scan_id)) {
-      const updated = [result, ...history].slice(0, 20)
-      setHistory(updated)
-      localStorage.setItem('atlas_history', JSON.stringify(updated))
+      setHistory(prev => [result, ...prev].slice(0, 20))
     }
   }, [result])
 
@@ -332,7 +328,31 @@ function App() {
         </div>
       )}
 
-      <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur-xl sticky top-0 z-40 glass">
+      {/* Save Results Banner — shown after scan completes */}
+      {result && result.status === 'completed' && (
+        <div className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between gap-4 px-6 py-3"
+             style={{background: 'linear-gradient(90deg, #7c3aed, #db2777)', boxShadow: '0 2px 16px rgba(124,58,237,0.4)'}}>
+          <div className="flex items-center gap-3 text-white text-sm font-medium">
+            <svg className="w-5 h-5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+            </svg>
+            <span>Your audit is complete. Results are not saved yet — sign up to keep them permanently.</span>
+          </div>
+          <div className="flex items-center gap-3 shrink-0">
+            <a href={`${HOMEPAGE}/login`}
+               style={{color:'rgba(255,255,255,0.8)', fontSize:'13px', textDecoration:'underline', textUnderlineOffset:'2px'}}>
+              Sign In
+            </a>
+            <a href={`${HOMEPAGE}/signup?scan_id=${result.scan_id}`}
+               style={{background:'white', color:'#7c3aed', padding:'6px 16px', borderRadius:'999px', fontSize:'13px', fontWeight:700, textDecoration:'none'}}>
+              Sign Up to Save →
+            </a>
+          </div>
+        </div>
+      )}
+
+      <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur-xl sticky z-40 glass"
+              style={{top: result && result.status === 'completed' ? '48px' : '0'}}>
         <div className="container mx-auto px-6 py-4">
           <div className="flex justify-between items-center">
             <div className="flex gap-4 items-center">
