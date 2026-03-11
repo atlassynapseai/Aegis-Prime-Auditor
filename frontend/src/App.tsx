@@ -312,11 +312,12 @@ function App() {
 
   // Check if malware was detected
   const hasMalware = result?.malware_detection && result.malware_detection.total_detections > 0
+  const showSaveBanner = result && result.status === 'completed'
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 animate-gradient">
       {toast && (
-        <div className="fixed top-4 right-4 z-50 px-6 py-4 rounded-xl shadow-2xl animate-slide-in hover-glow"
+        <div className={`fixed right-4 z-[60] px-6 py-4 rounded-xl shadow-2xl animate-slide-in hover-glow ${showSaveBanner ? 'top-20' : 'top-4'}`}
              style={{backgroundColor: toast.type==='success' ? '#10b981' : toast.type==='warning' ? '#f59e0b' : '#ef4444', color: 'white'}}>
           <div className="flex gap-3 items-center">
             <svg className="w-5 h-5 animate-bounce" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -329,7 +330,7 @@ function App() {
       )}
 
       {/* Save Results Banner — shown after scan completes */}
-      {result && result.status === 'completed' && (
+      {showSaveBanner && (
         <div className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between gap-4 px-6 py-3"
              style={{background: 'linear-gradient(90deg, #7c3aed, #db2777)', boxShadow: '0 2px 16px rgba(124,58,237,0.4)'}}>
           <div className="flex items-center gap-3 text-white text-sm font-medium">
@@ -351,8 +352,8 @@ function App() {
         </div>
       )}
 
-      <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur-xl sticky z-40 glass"
-              style={{top: result && result.status === 'completed' ? '48px' : '0'}}>
+            <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur-xl sticky z-40 glass"
+              style={{top: showSaveBanner ? '48px' : '0'}}>
         <div className="container mx-auto px-6 py-4">
           <div className="flex justify-between items-center">
             <div className="flex gap-4 items-center">
