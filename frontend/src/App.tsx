@@ -339,7 +339,7 @@ function App() {
             <span>Your audit is complete. Results are not saved yet — sign up to keep them permanently.</span>
           </div>
           <div className="flex items-center gap-3 shrink-0">
-            <a href={`${HOMEPAGE}/login`}
+            <a href={`${HOMEPAGE}/login?scan_id=${result.scan_id}`}
                style={{color:'rgba(255,255,255,0.8)', fontSize:'13px', textDecoration:'underline', textUnderlineOffset:'2px'}}>
               Sign In
             </a>
