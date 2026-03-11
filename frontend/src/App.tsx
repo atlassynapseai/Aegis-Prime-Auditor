@@ -604,8 +604,8 @@ function App() {
                 <div className="space-y-4">
                   <div
                     className={`relative border-2 border-dashed rounded-xl p-10 text-center transition-all ${isDragging
-                        ? 'border-blue-500 bg-blue-500/20 scale-105'
-                        : 'border-slate-700 hover:border-blue-500 hover:bg-blue-500/5'
+                      ? 'border-blue-500 bg-blue-500/20 scale-105'
+                      : 'border-slate-700 hover:border-blue-500 hover:bg-blue-500/5'
                       } group`}
                     onDragOver={handleDragOver}
                     onDragLeave={handleDragLeave}
