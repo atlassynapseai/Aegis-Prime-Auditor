@@ -48,8 +48,6 @@ function App() {
   const [selectedSev, setSelectedSev] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState<string | null>(null)
-  const [history, setHistory] = useState<ScanResult[]>([])
-  const [showHistory, setShowHistory] = useState(false)
   const [showCompliance, setShowCompliance] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' | 'warning' } | null>(null)
@@ -57,13 +55,6 @@ function App() {
   const BACKEND = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
 
   const HOMEPAGE = 'https://atlassynapseai.com'
-
-  // Keep scan history in memory only (no localStorage)
-  useEffect(() => {
-    if (result && result.status === 'completed' && !history.find(s => s.scan_id === result.scan_id)) {
-      setHistory(prev => [result, ...prev].slice(0, 20))
-    }
-  }, [result])
 
   const showToast = (msg: string, type: 'success' | 'error' | 'warning') => {
     setToast({ msg, type })
@@ -398,20 +389,13 @@ function App() {
                 </>
               )}
 
-              <button
-                onClick={() => setShowHistory(!showHistory)}
-                className="p-2 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-smooth hover-scale">
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-              </button>
             </div>
           </div>
         </div>
       </header>
 
       <div className="container mx-auto px-6 py-8">
-        {result && !showHistory && !showCompliance && (
+        {result && !showCompliance && (
           <>
             {hasMalware && (
               <div className="mb-4 p-5 bg-red-900/30 border-2 border-red-500 rounded-xl animate-fade-in hover-lift transition-smooth">
@@ -595,7 +579,7 @@ function App() {
           </div>
         )}
 
-        {!showHistory && !showCompliance && (
+        {!showCompliance && (
           <div className="grid lg:grid-cols-3 gap-8">
             <div className="space-y-6">
               <div className="bg-slate-900/50 rounded-2xl border border-slate-800 p-6 glass hover-lift transition-smooth">
@@ -953,58 +937,6 @@ function App() {
           </div>
         )}
 
-        {showHistory && (
-          <div className="animate-fade-in">
-            <div className="flex justify-between mb-6">
-              <h2 className="text-2xl font-bold text-white">Scan History</h2>
-              <button onClick={() => setShowHistory(false)} className="text-slate-400 hover:text-white hover-scale transition-smooth">
-                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            {history.length === 0 ? (
-              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-12 text-center glass">
-                <p className="text-slate-500">No scan history</p>
-              </div>
-            ) : (
-              <div className="grid gap-4">
-                {history.map((s, idx) => (
-                  <div
-                    key={s.scan_id}
-                    onClick={() => {
-                      setResult(s);
-                      setShowHistory(false);
-                      fetch(`${BACKEND}/api/scan/${s.scan_id}/compliance`)
-                        .then(r => r.json())
-                        .then(setCompliance)
-                        .catch(() => { })
-                    }}
-                    className="bg-slate-900/50 rounded-xl border border-slate-800 p-6 hover:border-blue-500 cursor-pointer hover-lift transition-smooth">
-                    <div className="flex justify-between">
-                      <div className="flex-1">
-                        <div className="flex gap-3 mb-2 items-center">
-                          <span className="text-2xl">{getFileIcon(s.file)}</span>
-                          <h3 className="text-white font-semibold">{s.file}</h3>
-                          {s.malware_detection && s.malware_detection.total_detections > 0 && (
-                            <span className="px-2 py-1 bg-red-600 text-white rounded text-xs font-bold flex items-center gap-1">
-                              🦠 {s.malware_detection.total_detections}
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-sm text-slate-400">{new Date(s.timestamp).toLocaleString()} • {s.total_findings} findings</p>
-                      </div>
-                      <div className="text-right">
-                        <div className="text-3xl font-bold text-white badge-pulse">{s.ai_analysis.risk_score}</div>
-                        <div className="text-xs text-slate-500 uppercase">RISK</div>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
       </div>
 
       <footer className="border-t border-slate-800 mt-16 glass">
