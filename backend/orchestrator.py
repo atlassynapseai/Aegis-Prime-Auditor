@@ -29,12 +29,12 @@ try:
     _sb_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
     supabase_db: SupabaseClient | None = create_client(_sb_url, _sb_key) if _sb_url and _sb_key else None
     if supabase_db:
-        logger.info("✅ Supabase connected — scan results will be persisted")
+        print("✅ Supabase connected — scan results will be persisted")
     else:
         logger.warning("⚠️  SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not set — results stored in memory only")
 except Exception as _sb_err:
     supabase_db = None
-    logger.warning(f"⚠️  Supabase init failed: {_sb_err}")
+    print(f"⚠️  Supabase init failed: {_sb_err}")
 from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
 from specialized_scanners import SpecializedScanner
 from file_parsers import FileParser
