@@ -31,7 +31,7 @@ try:
     if supabase_db:
         print("✅ Supabase connected — scan results will be persisted")
     else:
-        logger.warning("⚠️  SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not set — results stored in memory only")
+        print("⚠️  SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not set — results stored in memory only")
 except Exception as _sb_err:
     supabase_db = None
     print(f"⚠️  Supabase init failed: {_sb_err}")
