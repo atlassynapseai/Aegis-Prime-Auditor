@@ -22,6 +22,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from openai import OpenAI
 
+# Supabase client for persistent scan storage
+try:
+    from supabase import create_client, Client as SupabaseClient
+    _sb_url = os.environ.get("SUPABASE_URL", "")
+    _sb_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    supabase_db: SupabaseClient | None = create_client(_sb_url, _sb_key) if _sb_url and _sb_key else None
+    if supabase_db:
+        logger.info("✅ Supabase connected — scan results will be persisted")
+    else:
+        logger.warning("⚠️  SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not set — results stored in memory only")
+except Exception as _sb_err:
+    supabase_db = None
+    logger.warning(f"⚠️  Supabase init failed: {_sb_err}")
 from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
 from specialized_scanners import SpecializedScanner
 from file_parsers import FileParser
@@ -583,6 +596,22 @@ async def scan_code(files: List[UploadFile] = File(...)):
         }
         
         SCAN_RESULTS_STORE[scan_id] = result
+        
+        # Persist to Supabase (user_id null until user claims after signup)
+        if supabase_db:
+            try:
+                supabase_db.table("scan_results").insert({
+                    "scan_id": scan_id,
+                    "user_id": None,
+                    "file_desc": file_desc,
+                    "total_findings": len(all_findings),
+                    "risk_score": result["ai_analysis"].get("risk_score"),
+                    "risk_level": result["ai_analysis"].get("risk_level"),
+                    "result_data": result,
+                }).execute()
+                logger.info(f"✅ Scan {scan_id} saved to Supabase")
+            except Exception as _e:
+                logger.warning(f"⚠️  Supabase save failed (non-critical): {_e}")
         logger.info(f"✅ Scan {scan_id}: {len(uploaded_filenames)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
         
         return JSONResponse(content=result)
