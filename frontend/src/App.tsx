@@ -344,9 +344,9 @@ function App() {
               style={{ color: 'rgba(255,255,255,0.8)', fontSize: '13px', textDecoration: 'underline', textUnderlineOffset: '2px' }}>
               Sign In
             </a>
-            <a href={`${HOMEPAGE}/signup?scan_id=${result.scan_id}`}
+            <a href={`${HOMEPAGE}/claim-scan?scan_id=${result.scan_id}`}
               style={{ background: 'white', color: '#7c3aed', padding: '6px 16px', borderRadius: '999px', fontSize: '13px', fontWeight: 700, textDecoration: 'none' }}>
-              Sign Up to Save →
+              Sign Up to Save Results →
             </a>
           </div>
         </div>
