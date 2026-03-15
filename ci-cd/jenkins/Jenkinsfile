@@ -1,0 +1,217 @@
+// ci-cd/jenkins/Jenkinsfile
+//
+// Jenkins Declarative Pipeline — Aegis Prime Security Scan
+//
+// Required credentials (configure in Jenkins → Manage Credentials):
+//   AEGIS_API_URL  — Secret text: Railway backend URL
+//   AEGIS_API_KEY  — Secret text: API key configured on the Railway backend
+//
+// Required Jenkins plugins: pipeline, credentials-binding, http_request (or curl via sh)
+
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        // These are populated from Jenkins credentials store
+        AEGIS_API_URL = credentials('AEGIS_API_URL')
+        AEGIS_API_KEY = credentials('AEGIS_API_KEY')
+
+        // Tunable gates
+        RISK_SCORE_FAIL_THRESHOLD = '80'
+        HIGH_FINDINGS_UNSTABLE_THRESHOLD = '5'
+    }
+
+    stages {
+
+        // ── Checkout ─────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        // ── Bundle files for scanning ────────────────────────────────────────
+        stage('Bundle Source') {
+            steps {
+                sh '''
+                    echo "📦 Bundling source files for Aegis scan..."
+                    zip -r /tmp/aegis-payload.zip . \
+                        --include "*.py" "*.js" "*.ts" "*.jsx" "*.tsx" \
+                                  "*.java" "*.go" "*.rb" "*.php" "*.c" "*.cpp" "*.cs" \
+                                  "*.html" "*.htm" "*.xml" "*.json" "*.yaml" "*.yml" \
+                                  "*.sh" "*.md" \
+                        -x ".git/*" "node_modules/*" ".venv/*" "__pycache__/*" || true
+                    echo "Payload size: $(du -sh /tmp/aegis-payload.zip | cut -f1)"
+                '''
+            }
+        }
+
+        // ── Submit scan to Aegis backend ──────────────────────────────────────
+        stage('Aegis Security Scan') {
+            steps {
+                script {
+                    // Submit the scan and capture the result JSON
+                    sh '''
+                        echo "🔍 Submitting scan to Aegis backend..."
+                        HTTP_CODE=$(curl -s -o "${WORKSPACE}/aegis-result.json" -w "%{http_code}" \\
+                            -X POST "${AEGIS_API_URL}/api/scan" \\
+                            -H "X-API-Key: ${AEGIS_API_KEY}" \\
+                            -F "files=@/tmp/aegis-payload.zip" \\
+                            --max-time 300)
+
+                        echo "HTTP status: $HTTP_CODE"
+                        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+                            echo "ERROR: Aegis API returned HTTP $HTTP_CODE"
+                            cat "${WORKSPACE}/aegis-result.json" || true
+                            exit 1
+                        fi
+                        echo "Scan submitted successfully."
+                    '''
+
+                    // Parse the JSON result using shell + jq
+                    def riskScore = sh(
+                        script: "jq '.ai_analysis.risk_score // 0' '${WORKSPACE}/aegis-result.json'",
+                        returnStdout: true
+                    ).trim().toInteger()
+
+                    def riskLevel = sh(
+                        script: "jq -r '.ai_analysis.risk_level // \"UNKNOWN\"' '${WORKSPACE}/aegis-result.json'",
+                        returnStdout: true
+                    ).trim()
+
+                    def totalFindings = sh(
+                        script: "jq '.total_findings // 0' '${WORKSPACE}/aegis-result.json'",
+                        returnStdout: true
+                    ).trim().toInteger()
+
+                    def criticalCount = sh(
+                        script: "jq '.severity_breakdown.CRITICAL // 0' '${WORKSPACE}/aegis-result.json'",
+                        returnStdout: true
+                    ).trim().toInteger()
+
+                    def highCount = sh(
+                        script: "jq '.severity_breakdown.HIGH // 0' '${WORKSPACE}/aegis-result.json'",
+                        returnStdout: true
+                    ).trim().toInteger()
+
+                    def scanId = sh(
+                        script: "jq -r '.scan_id // \"unknown\"' '${WORKSPACE}/aegis-result.json'",
+                        returnStdout: true
+                    ).trim()
+
+                    // Print summary
+                    sh """
+                        echo "════════════════════════════════════════"
+                        echo "  AEGIS PRIME SECURITY SCAN RESULTS"
+                        echo "════════════════════════════════════════"
+                        echo "  Scan ID    : ${scanId}"
+                        echo "  Risk Score : ${riskScore} / 100"
+                        echo "  Risk Level : ${riskLevel}"
+                        echo "  Total      : ${totalFindings} findings"
+                        echo "  CRITICAL   : ${criticalCount}"
+                        echo "  HIGH       : ${highCount}"
+                        echo "════════════════════════════════════════"
+                        echo ""
+                        echo "Top findings:"
+                        jq -r '.all_findings[:5][] | "  [\\(.severity)] \\(.engine): \\(.message) — \\(.file)"' \\
+                            "${WORKSPACE}/aegis-result.json" 2>/dev/null || echo "  (none)"
+                    """
+
+                    // Store for downstream stages
+                    env.AEGIS_RISK_SCORE     = riskScore.toString()
+                    env.AEGIS_RISK_LEVEL     = riskLevel
+                    env.AEGIS_TOTAL_FINDINGS = totalFindings.toString()
+                    env.AEGIS_CRITICAL       = criticalCount.toString()
+                    env.AEGIS_HIGH           = highCount.toString()
+                    env.AEGIS_SCAN_ID        = scanId
+                }
+            }
+        }
+
+        // ── Enforce security gates ────────────────────────────────────────────
+        stage('Security Gates') {
+            steps {
+                script {
+                    def critical  = env.AEGIS_CRITICAL.toInteger()
+                    def highCount = env.AEGIS_HIGH.toInteger()
+                    def riskScore = env.AEGIS_RISK_SCORE.toInteger()
+                    def highThreshold  = env.HIGH_FINDINGS_UNSTABLE_THRESHOLD.toInteger()
+                    def riskThreshold  = env.RISK_SCORE_FAIL_THRESHOLD.toInteger()
+
+                    if (critical > 0) {
+                        // CRITICAL findings → FAILED build (blocks merge)
+                        error("❌ Build FAILED: ${critical} CRITICAL finding(s) detected. Remediate before merging.")
+                    }
+
+                    if (riskScore >= riskThreshold) {
+                        // Risk score too high → FAILED build
+                        error("❌ Build FAILED: Risk score ${riskScore}/100 exceeds threshold of ${riskThreshold}.")
+                    }
+
+                    if (highCount > highThreshold) {
+                        // Many HIGH findings → UNSTABLE (warns but does not block)
+                        currentBuild.result = 'UNSTABLE'
+                        echo "⚠️  Build UNSTABLE: ${highCount} HIGH finding(s) exceed threshold of ${highThreshold}."
+                    } else {
+                        echo "✅ All security gates passed (risk=${riskScore}, critical=${critical}, high=${highCount})."
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Post-build: archive results ───────────────────────────────────────────
+    post {
+        always {
+            archiveArtifacts(
+                artifacts: 'aegis-result.json',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+
+            script {
+                def scanId    = env.AEGIS_SCAN_ID    ?: 'unknown'
+                def riskScore = env.AEGIS_RISK_SCORE  ?: '0'
+                def critical  = env.AEGIS_CRITICAL    ?: '0'
+                def high      = env.AEGIS_HIGH         ?: '0'
+                def total     = env.AEGIS_TOTAL_FINDINGS ?: '0'
+                def level     = env.AEGIS_RISK_LEVEL  ?: 'UNKNOWN'
+
+                def summary = """
+<h3>🛡️ Aegis Prime Security Scan</h3>
+<table>
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td>Scan ID</td><td>${scanId}</td></tr>
+  <tr><td>Risk Score</td><td><b>${riskScore}/100</b></td></tr>
+  <tr><td>Risk Level</td><td><b>${level}</b></td></tr>
+  <tr><td>Total Findings</td><td>${total}</td></tr>
+  <tr><td>CRITICAL</td><td style='color:red'>${critical}</td></tr>
+  <tr><td>HIGH</td><td style='color:orange'>${high}</td></tr>
+</table>
+"""
+                // Publish summary as build description (visible in build list)
+                currentBuild.description = "Risk: ${riskScore}/100 | Critical: ${critical} | High: ${high}"
+
+                // Write HTML summary for Jenkins HTML Publisher (if plugin is installed)
+                writeFile(
+                    file: 'aegis-scan-summary.html',
+                    text: "<html><body>${summary}</body></html>"
+                )
+            }
+
+            publishHTML(target: [
+                allowMissing:          true,
+                alwaysLinkToLastBuild: true,
+                keepAll:               true,
+                reportDir:             '.',
+                reportFiles:           'aegis-scan-summary.html',
+                reportName:            'Aegis Security Scan'
+            ])
+        }
+    }
+}
