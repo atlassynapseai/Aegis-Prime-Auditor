@@ -12,8 +12,11 @@ import asyncio
 import re
 import time
 import logging
-from datetime import datetime
-from typing import List, Dict, Any
+import hashlib
+import hmac
+import fcntl
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -130,6 +133,105 @@ class PerformanceMetrics:
         }
 
 metrics = PerformanceMetrics()
+
+# Immutable audit log
+_AUDIT_LOG_SECRET = os.getenv("AUDIT_LOG_SECRET", "").encode()
+if not _AUDIT_LOG_SECRET:
+    import warnings as _warnings
+    _warnings.warn(
+        "AUDIT_LOG_SECRET is not set — using an insecure default key. "
+        "Set the AUDIT_LOG_SECRET environment variable to a strong random value "
+        "to ensure tamper-evidence of audit logs.",
+        RuntimeWarning,
+        stacklevel=1,
+    )
+    _AUDIT_LOG_SECRET = b"atlas-synapse-audit-hmac-key"
+
+import threading as _threading
+
+class AuditLogger:
+    """Append-only, tamper-evident audit logger.
+
+    Each log entry is written as a single JSON line to ``atlas_audit.log``.
+    Entries are chained: every record includes the HMAC-SHA256 of the
+    *previous* entry's digest so that post-hoc tampering can be detected.
+    The log file is opened in append mode with an exclusive ``fcntl`` lock
+    held for the duration of each write so concurrent processes cannot
+    interleave writes.  A threading lock additionally serialises in-process
+    access to ``_prev_digest`` so the chain stays consistent under async/
+    multi-threaded workloads.
+    """
+
+    LOG_PATH = Path(__file__).parent / "atlas_audit.log"
+    _prev_digest: str = "0" * 64  # genesis sentinel
+    _lock: _threading.Lock = _threading.Lock()
+
+    @classmethod
+    def _compute_digest(cls, entry: Dict[str, Any]) -> str:
+        payload = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+        return hmac.new(_AUDIT_LOG_SECRET, payload.encode(), hashlib.sha256).hexdigest()
+
+    @classmethod
+    def log(
+        cls,
+        event: str,
+        scan_id: str,
+        *,
+        file_desc: str = "",
+        total_findings: int = 0,
+        risk_level: str = "UNKNOWN",
+        risk_score: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append one audit record to the log file (thread-safe, atomic)."""
+        with cls._lock:
+            prev = cls._prev_digest
+            entry: Dict[str, Any] = {
+                "event": event,
+                "scan_id": scan_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "file_desc": file_desc,
+                "total_findings": total_findings,
+                "risk_level": risk_level,
+                "risk_score": risk_score,
+                "prev_digest": prev,
+            }
+            if extra:
+                entry["extra"] = extra
+            digest = cls._compute_digest(entry)
+            entry["digest"] = digest
+
+            try:
+                with open(cls.LOG_PATH, "a", encoding="utf-8") as fh:
+                    fcntl.flock(fh, fcntl.LOCK_EX)
+                    try:
+                        fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                        fh.flush()
+                    finally:
+                        fcntl.flock(fh, fcntl.LOCK_UN)
+                cls._prev_digest = digest
+            except Exception as _audit_err:
+                logger.warning(f"⚠️  Audit log write failed (non-critical): {_audit_err}")
+                return  # do not update _prev_digest if the write failed
+
+        # Mirror to Supabase audit_logs table (outside the lock — I/O bound)
+        if supabase_db:
+            try:
+                supabase_db.table("audit_logs").insert({
+                    "event": event,
+                    "scan_id": scan_id,
+                    "timestamp": entry["timestamp"],
+                    "file_desc": file_desc,
+                    "total_findings": total_findings,
+                    "risk_level": risk_level,
+                    "risk_score": risk_score,
+                    "digest": digest,
+                    "prev_digest": prev,
+                }).execute()
+            except Exception as _sb_audit_err:
+                logger.debug(f"Supabase audit mirror skipped: {_sb_audit_err}")
+
+audit_logger = AuditLogger()
 
 # Scanners
 class SemgrepScanner:
@@ -612,6 +714,23 @@ async def scan_code(files: List[UploadFile] = File(...)):
                 logger.info(f"✅ Scan {scan_id} saved to Supabase")
             except Exception as _e:
                 logger.warning(f"⚠️  Supabase save failed (non-critical): {_e}")
+
+        # Write immutable audit log entry
+        AuditLogger.log(
+            "scan_completed",
+            scan_id,
+            file_desc=file_desc,
+            total_findings=len(all_findings),
+            risk_level=result["ai_analysis"].get("risk_level", "UNKNOWN"),
+            risk_score=result["ai_analysis"].get("risk_score"),
+            extra={
+                "files_scanned": len(files_to_scan),
+                "uploaded_files": len(uploaded_filenames),
+                "malware_detections": (
+                    malware_stats.get("total_detections", 0) if malware_scanner else 0
+                ),
+            },
+        )
         logger.info(f"✅ Scan {scan_id}: {len(uploaded_filenames)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
         
         return JSONResponse(content=result)
@@ -695,6 +814,22 @@ async def list_frameworks():
         "frameworks": [{"id": k, "name": v.get("name", k)} for k, v in ComplianceMapper.FRAMEWORKS.items()],
         "total": len(ComplianceMapper.FRAMEWORKS)
     })
+
+@app.get("/api/audit-logs")
+async def get_audit_logs(limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
+    """Return recent immutable audit log entries (read-only; file is append-only)."""
+    entries: List[Dict[str, Any]] = []
+    if AuditLogger.LOG_PATH.exists():
+        try:
+            with open(AuditLogger.LOG_PATH, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        entries.append(json.loads(line))
+        except Exception as _e:
+            logger.warning(f"Audit log read error: {_e}")
+    total = len(entries)
+    return JSONResponse(content={"audit_logs": entries[offset: offset + limit], "total": total})
 
 if __name__ == "__main__":
     import uvicorn

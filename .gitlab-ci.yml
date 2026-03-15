@@ -1,0 +1,151 @@
+# Atlas Synapse Aegis Prime Auditor — GitLab CI Integration
+# Runs a security scan on every merge-request and push to the default branch.
+#
+# Required CI/CD variables (Settings → CI/CD → Variables):
+#   AEGIS_BACKEND_URL     — URL of your deployed Aegis backend (e.g. https://api.example.com)
+#
+# Optional variables:
+#   AEGIS_FAIL_ON_CRITICAL — set to "true" to fail the pipeline on CRITICAL findings (default: true)
+#   AEGIS_MAX_FILES        — maximum number of source files to upload per scan (default: 10)
+#                            Keeping this low avoids timeout issues on large repos; increase as needed.
+
+stages:
+  - security-scan
+
+variables:
+  AEGIS_BACKEND_URL:      "${AEGIS_BACKEND_URL}"
+  AEGIS_FAIL_ON_CRITICAL: "${AEGIS_FAIL_ON_CRITICAL:-true}"
+  AEGIS_MAX_FILES:        "${AEGIS_MAX_FILES:-10}"
+
+aegis-security-scan:
+  stage: security-scan
+  image: python:3.12-slim
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+  before_script:
+    - pip install --quiet requests
+  script:
+    - |
+      python3 - <<'PYEOF'
+      import os, sys, json, glob, requests
+
+      backend = os.environ.get("AEGIS_BACKEND_URL", "").rstrip("/")
+      if not backend:
+          print("WARNING: AEGIS_BACKEND_URL is not set — skipping Aegis scan.")
+          sys.exit(0)
+
+      fail_on_critical = os.environ.get("AEGIS_FAIL_ON_CRITICAL", "true").lower() == "true"
+      max_files = int(os.environ.get("AEGIS_MAX_FILES", "10"))
+
+      # Collect source files to scan; limit upload count to avoid API timeouts.
+      # Raise AEGIS_MAX_FILES if your backend can handle larger payloads.
+      patterns = ["**/*.py", "**/*.js", "**/*.ts", "**/*.java", "**/*.go"]
+      files = []
+      for pat in patterns:
+          files.extend(glob.glob(pat, recursive=True))
+      files = [f for f in files if ".git" not in f and "node_modules" not in f][:max_files]
+
+      if not files:
+          print("INFO: No source files found — skipping scan.")
+          sys.exit(0)
+
+      print(f"Scanning {len(files)} file(s) via {backend}/api/scan ...")
+
+      # Upload all collected files in a single multipart request
+      file_handles = []
+      try:
+          for path in files:
+              fh = open(path, "rb")
+              file_handles.append(fh)
+          resp = requests.post(
+              f"{backend}/api/scan",
+              files=[("files", (os.path.basename(f), fh, "application/octet-stream"))
+                     for f, fh in zip(files, file_handles)],
+              timeout=180,
+          )
+      finally:
+          for fh in file_handles:
+              fh.close()
+
+      if resp.status_code != 200:
+          print(f"ERROR: Scan request failed: {resp.status_code} — {resp.text[:200]}")
+          sys.exit(1)
+
+      data = resp.json()
+      total    = data.get("total_findings", 0)
+      ai       = data.get("ai_analysis", {})
+      risk     = ai.get("risk_level", "UNKNOWN")
+      score    = ai.get("risk_score", 0)
+      sev      = data.get("severity_breakdown", {})
+      critical = sev.get("CRITICAL", 0)
+      high     = sev.get("HIGH", 0)
+
+      print("=" * 60)
+      print("  ATLAS SYNAPSE - AEGIS PRIME SECURITY SCAN RESULTS")
+      print("=" * 60)
+      print(f"  Risk Level    : {risk}")
+      print(f"  Risk Score    : {score}/100")
+      print(f"  Total Findings: {total}")
+      print(f"  Critical      : {critical}")
+      print(f"  High          : {high}")
+      print("=" * 60)
+
+      # Build a GitLab SAST report from actual findings
+      sev_map = {"CRITICAL": "Critical", "HIGH": "High", "MEDIUM": "Medium", "LOW": "Low", "INFO": "Info"}
+      vulns = []
+      for finding in data.get("all_findings", []):
+          severity = sev_map.get(finding.get("severity", "").upper(), "Unknown")
+          vulns.append({
+              "id": finding.get("id", ""),
+              "category": "sast",
+              "name": finding.get("message", "Security Finding"),
+              "message": finding.get("message", ""),
+              "description": finding.get("snippet", ""),
+              "cve": finding.get("cve") or finding.get("cwe") or "",
+              "severity": severity,
+              "scanner": {"id": "aegis-prime", "name": "Aegis Prime Auditor"},
+              "location": {
+                  "file": finding.get("file", ""),
+                  "start_line": finding.get("line_start", 1),
+              },
+              "identifiers": [
+                  {"type": "aegis_rule", "name": finding.get("rule", "unknown"),
+                   "value": finding.get("rule", "")}
+              ],
+          })
+
+      sast_report = {
+          "version": "15.0.4",
+          "vulnerabilities": vulns,
+          "scan": {
+              "scanner": {
+                  "id": "aegis-prime",
+                  "name": "Aegis Prime Auditor",
+                  "version": "3.1",
+                  "vendor": {"name": "Atlas Synapse"},
+              },
+              "type": "sast",
+              "status": "success",
+          },
+      }
+      with open("gl-sast-report.json", "w") as out:
+          json.dump(sast_report, out, indent=2)
+      print(f"SAST report written: {len(vulns)} vulnerabilities")
+
+      if fail_on_critical and critical > 0:
+          print(f"ERROR: {critical} CRITICAL finding(s) detected — pipeline blocked.")
+          sys.exit(1)
+      elif high > 3:
+          print(f"WARNING: {high} HIGH severity findings require review.")
+      else:
+          print("OK: No critical security issues detected.")
+      PYEOF
+  artifacts:
+    when: always
+    expire_in: 30 days
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - gl-sast-report.json
