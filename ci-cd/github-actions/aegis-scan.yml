@@ -1,0 +1,217 @@
+# ci-cd/github-actions/aegis-scan.yml
+#
+# Reusable GitHub Actions workflow — Aegis Prime Security Scan
+#
+# Usage (call from your repo's workflow):
+#
+#   jobs:
+#     aegis:
+#       uses: atlassynapseai/Aegis-Prime-Auditor/.github/workflows/reusable-aegis-scan.yml@main
+#       secrets:
+#         AEGIS_API_URL: ${{ secrets.AEGIS_API_URL }}
+#         AEGIS_API_KEY: ${{ secrets.AEGIS_API_KEY }}
+#
+# Or copy this file into your own repo and trigger it directly.
+#
+# Required secrets:
+#   AEGIS_API_URL  — Railway backend URL, e.g. https://aegis-xxxx.up.railway.app
+#   AEGIS_API_KEY  — API key set on the Railway backend (AEGIS_API_KEY env var)
+
+name: Aegis Prime Security Scan
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  aegis-scan:
+    name: Aegis Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Collect files to scan ──────────────────────────────────────────────
+      - name: Bundle source files for scanning
+        run: |
+          # Pack all source code into a single ZIP (max 50 MB accepted by Aegis)
+          zip -r /tmp/aegis-scan-payload.zip . \
+            --include "*.py" "*.js" "*.ts" "*.jsx" "*.tsx" \
+                      "*.java" "*.go" "*.rb" "*.php" "*.c" "*.cpp" "*.cs" \
+                      "*.html" "*.htm" "*.xml" "*.json" "*.yaml" "*.yml" \
+                      "*.sh" "*.md" \
+            -x ".git/*" "node_modules/*" ".venv/*" "__pycache__/*" \
+            || true
+          echo "Payload size: $(du -sh /tmp/aegis-scan-payload.zip | cut -f1)"
+
+      # ── Call the Aegis API ─────────────────────────────────────────────────
+      - name: Submit scan to Aegis backend
+        id: submit
+        env:
+          AEGIS_API_URL: ${{ secrets.AEGIS_API_URL }}
+          AEGIS_API_KEY: ${{ secrets.AEGIS_API_KEY }}
+        run: |
+          if [ -z "$AEGIS_API_URL" ]; then
+            echo "::error::AEGIS_API_URL secret is not set"
+            exit 1
+          fi
+
+          HTTP_CODE=$(curl -s -o /tmp/aegis-result.json -w "%{http_code}" \
+            -X POST "${AEGIS_API_URL}/api/scan" \
+            -H "X-API-Key: ${AEGIS_API_KEY}" \
+            -F "files=@/tmp/aegis-scan-payload.zip" \
+            --max-time 300)
+
+          echo "HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Aegis API returned HTTP $HTTP_CODE"
+            cat /tmp/aegis-result.json || true
+            exit 1
+          fi
+
+          echo "scan_id=$(jq -r '.scan_id // "unknown"' /tmp/aegis-result.json)" >> "$GITHUB_OUTPUT"
+          echo "Scan submitted successfully"
+
+      # ── Parse results ──────────────────────────────────────────────────────
+      - name: Parse scan results
+        id: parse
+        run: |
+          RESULT=/tmp/aegis-result.json
+
+          TOTAL=$(jq '.total_findings // 0' "$RESULT")
+          RISK=$(jq '.ai_analysis.risk_score // 0' "$RESULT")
+          LEVEL=$(jq -r '.ai_analysis.risk_level // "UNKNOWN"' "$RESULT")
+          CRITICAL=$(jq '.severity_breakdown.CRITICAL // 0' "$RESULT")
+          HIGH=$(jq '.severity_breakdown.HIGH // 0' "$RESULT")
+          MEDIUM=$(jq '.severity_breakdown.MEDIUM // 0' "$RESULT")
+          LOW=$(jq '.severity_breakdown.LOW // 0' "$RESULT")
+          SCAN_ID=$(jq -r '.scan_id // "unknown"' "$RESULT")
+
+          # Top 3 findings (message + severity)
+          TOP3=$(jq -r '
+            [.all_findings[:3][] | "• [\(.severity)] \(.message // "n/a") — \(.file // "")"]
+            | join("\n")
+          ' "$RESULT" 2>/dev/null || echo "• (no findings)")
+
+          echo "total=$TOTAL"         >> "$GITHUB_OUTPUT"
+          echo "risk_score=$RISK"     >> "$GITHUB_OUTPUT"
+          echo "risk_level=$LEVEL"    >> "$GITHUB_OUTPUT"
+          echo "critical=$CRITICAL"   >> "$GITHUB_OUTPUT"
+          echo "high=$HIGH"           >> "$GITHUB_OUTPUT"
+          echo "medium=$MEDIUM"       >> "$GITHUB_OUTPUT"
+          echo "low=$LOW"             >> "$GITHUB_OUTPUT"
+          echo "scan_id=$SCAN_ID"     >> "$GITHUB_OUTPUT"
+
+          # Multi-line output
+          {
+            echo "top3<<EOF"
+            echo "$TOP3"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Step summary
+          {
+            echo "## 🛡️ Aegis Security Scan Results"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Risk Score | **$RISK / 100** |"
+            echo "| Risk Level | **$LEVEL** |"
+            echo "| Total Findings | $TOTAL |"
+            echo "| CRITICAL | $CRITICAL |"
+            echo "| HIGH | $HIGH |"
+            echo "| MEDIUM | $MEDIUM |"
+            echo "| LOW | $LOW |"
+            echo ""
+            echo "### Top Issues"
+            echo "$TOP3"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Post PR comment ────────────────────────────────────────────────────
+      - name: Post PR comment with scan summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          TOTAL:      ${{ steps.parse.outputs.total }}
+          RISK_SCORE: ${{ steps.parse.outputs.risk_score }}
+          RISK_LEVEL: ${{ steps.parse.outputs.risk_level }}
+          CRITICAL:   ${{ steps.parse.outputs.critical }}
+          HIGH:       ${{ steps.parse.outputs.high }}
+          MEDIUM:     ${{ steps.parse.outputs.medium }}
+          LOW:        ${{ steps.parse.outputs.low }}
+          SCAN_ID:    ${{ steps.parse.outputs.scan_id }}
+          TOP3:       ${{ steps.parse.outputs.top3 }}
+          AEGIS_API_URL: ${{ secrets.AEGIS_API_URL }}
+        with:
+          script: |
+            const { TOTAL, RISK_SCORE, RISK_LEVEL, CRITICAL, HIGH, MEDIUM, LOW, SCAN_ID, TOP3, AEGIS_API_URL } = process.env;
+            const emoji = parseInt(CRITICAL) > 0 ? '🔴' : parseInt(HIGH) > 5 ? '🟠' : parseInt(RISK_SCORE) >= 80 ? '🟡' : '🟢';
+            const dashboardUrl = `${AEGIS_API_URL || 'https://atlassynapseai.com'}/claim-scan?scan_id=${SCAN_ID}`;
+
+            const body = [
+              `## ${emoji} Aegis Prime Security Scan`,
+              '',
+              `| Metric | Value |`,
+              `|--------|-------|`,
+              `| Risk Score | **${RISK_SCORE} / 100** |`,
+              `| Risk Level | **${RISK_LEVEL}** |`,
+              `| Total Findings | ${TOTAL} |`,
+              `| CRITICAL | ${CRITICAL} |`,
+              `| HIGH | ${HIGH} |`,
+              `| MEDIUM | ${MEDIUM} |`,
+              `| LOW | ${LOW} |`,
+              '',
+              '### Top 3 Issues',
+              TOP3 || '_No findings_',
+              '',
+              `[📊 View full report](${dashboardUrl})`,
+              '',
+              '---',
+              '*Powered by Atlas Synapse Aegis Prime Auditor*',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # ── Upload raw JSON artifact ───────────────────────────────────────────
+      - name: Upload scan results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-scan-results-${{ steps.parse.outputs.scan_id }}
+          path: /tmp/aegis-result.json
+          retention-days: 30
+
+      # ── Enforce gates ──────────────────────────────────────────────────────
+      - name: Enforce security gates
+        run: |
+          RISK=${{ steps.parse.outputs.risk_score }}
+          CRITICAL=${{ steps.parse.outputs.critical }}
+
+          FAIL=0
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "::error::❌ GATE FAILED — $CRITICAL CRITICAL finding(s) detected. Merge blocked."
+            FAIL=1
+          fi
+          if [ "$RISK" -ge 80 ]; then
+            echo "::error::❌ GATE FAILED — Risk score $RISK/100 exceeds threshold of 80. Merge blocked."
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -eq 1 ]; then
+            exit 1
+          fi
+
+          echo "✅ All security gates passed (risk=$RISK, critical=$CRITICAL)"

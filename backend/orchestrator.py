@@ -35,6 +35,29 @@ try:
 except Exception as _sb_err:
     supabase_db = None
     print(f"⚠️  Supabase init failed: {_sb_err}")
+
+
+def _log_audit(scan_id: str, event: str, engine: str = "", detail: dict = None) -> None:
+    """Append an immutable audit log entry to the audit_logs table in Supabase.
+
+    This function is insert-only by design (SOC 2 requirement). The Supabase
+    table must have an RLS policy that permits INSERT but denies UPDATE/DELETE.
+    Failures are swallowed so that audit logging never blocks the scan path.
+    """
+    if not supabase_db:
+        return
+    try:
+        supabase_db.table("audit_logs").insert({
+            "scan_id": scan_id,
+            "event": event,
+            "engine": engine,
+            "detail": detail or {},
+        }).execute()
+    except Exception as _audit_err:
+        # Non-blocking — log locally but do not surface to caller
+        logging.getLogger(__name__).warning(f"⚠️  Audit log write failed: {_audit_err}")
+
+
 from background_processor import FilePrioritizer, BackgroundScanManager, background_manager
 from specialized_scanners import SpecializedScanner
 from file_parsers import FileParser
@@ -50,6 +73,13 @@ except ImportError:
     MALWARE_DETECTION_AVAILABLE = False
     logger_temp = logging.getLogger(__name__)
     logger_temp.warning("⚠️ Malware detection modules not found")
+
+# Malware Tier 2 — cloud intelligence (optional)
+try:
+    from malware_tier2 import MalwareTier2Scanner
+    MALWARE_TIER2_AVAILABLE = True
+except ImportError:
+    MALWARE_TIER2_AVAILABLE = False
 
 # Logging
 logging.basicConfig(
@@ -78,6 +108,7 @@ app.add_middleware(
 GEMINI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")  # Optional
+OTX_API_KEY = os.getenv("OTX_API_KEY", "")  # Optional — AlienVault OTX
 SCAN_TIMEOUT = int(os.getenv("SCAN_TIMEOUT_SECONDS", "120"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50"))
 
@@ -393,15 +424,26 @@ def generate_heatmap(findings):
     max_w = max([m["risk_weight"] for m in matrix.values()] + [1])
     return [{**m, "normalized": round(m["risk_weight"]/max_w, 2) if max_w else 0} for m in matrix.values()]
 
-async def _run_scanners(path: str):
+async def _run_scanners(path: str, scan_id: str = ""):
     loop = asyncio.get_event_loop()
+    scanner_names = ['semgrep', 'gitleaks', 'trivy', 'codeql']
     tasks = [loop.run_in_executor(executor, s.scan, path) for s in [SemgrepScanner, GitleaksScanner, TrivyScanner, CodeQLScanner]]
+
+    for name in scanner_names:
+        _log_audit(scan_id, "engine_started", engine=name, detail={"file": Path(path).name})
+
     results = await asyncio.gather(*tasks)
-    
+
     engines, timings = {}, {}
-    for (data, elapsed), name in zip(results, ['semgrep', 'gitleaks', 'trivy', 'codeql']):
+    for (data, elapsed), name in zip(results, scanner_names):
         engines[name], timings[name] = data, elapsed
-    
+        _log_audit(scan_id, "engine_completed", engine=name, detail={
+            "file": Path(path).name,
+            "findings": len(data.get("findings", [])),
+            "elapsed_s": round(elapsed, 2),
+            "error": data.get("error"),
+        })
+
     return (engines, timings)
 
 # API
@@ -441,13 +483,15 @@ async def scan_code(files: List[UploadFile] = File(...)):
     import zipfile
     
     req_start = time.time()
-    scan_id = str(uuid.uuid4())[:8]
+    scan_id = str(uuid.uuid4())[:8]  # defined before try so the except block can reference it
     scan_dir = UPLOAD_DIR / scan_id
     scan_dir.mkdir(exist_ok=True)
     
     try:
         files_to_scan = []
         uploaded_filenames = []
+
+        _log_audit(scan_id, "scan_started", detail={"file_count": len(files)})
         
         # Process uploaded files
         for uploaded_file in files:
@@ -455,6 +499,7 @@ async def scan_code(files: List[UploadFile] = File(...)):
             
             if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
                 logger.warning(f"Skipping {uploaded_file.filename} - too large")
+                _log_audit(scan_id, "file_skipped", detail={"filename": uploaded_file.filename, "reason": "too_large"})
                 continue
             
             file_path = scan_dir / uploaded_file.filename
@@ -483,6 +528,7 @@ async def scan_code(files: List[UploadFile] = File(...)):
                         logger.info(f"ZIP {uploaded_file.filename}: {len(files_to_scan)} files")
                 except Exception as e:
                     logger.error(f"ZIP extraction failed: {e}")
+                    _log_audit(scan_id, "error", engine="zip", detail={"filename": uploaded_file.filename, "error": str(e)})
             else:
                 files_to_scan.append(file_path)
         
@@ -501,30 +547,61 @@ async def scan_code(files: List[UploadFile] = File(...)):
         
         if len(files_to_scan) == 1:
             # Single file: full scan
-            engines, timings = await _run_scanners(str(files_to_scan[0]))
+            engines, timings = await _run_scanners(str(files_to_scan[0]), scan_id=scan_id)
             for data in engines.values():
                 all_findings.extend(data.get("findings", []))
             
-            # Add malware detection
+            # Add malware detection (Tier 1: YARA + heuristics)
             if malware_scanner:
+                _log_audit(scan_id, "engine_started", engine="malware_tier1", detail={"file": files_to_scan[0].name})
                 try:
                     malware_result = malware_scanner.scan_file(str(files_to_scan[0]))
                     all_findings.extend(malware_result.get("findings", []))
                     malware_stats["total_detections"] = malware_result.get("total_detections", 0)
                     malware_stats["yara_hits"] = malware_result.get("scanners_used", {}).get("yara", 0)
                     logger.info(f"🦠 Malware scan: {malware_result['total_detections']} detections")
+                    _log_audit(scan_id, "engine_completed", engine="malware_tier1", detail={
+                        "file": files_to_scan[0].name,
+                        "detections": malware_result.get("total_detections", 0),
+                    })
                 except Exception as e:
                     logger.error(f"Malware scan error: {e}")
+                    _log_audit(scan_id, "error", engine="malware_tier1", detail={"error": str(e)})
             
             # Add heuristic analysis
             if MALWARE_DETECTION_AVAILABLE:
+                _log_audit(scan_id, "engine_started", engine="heuristic", detail={"file": files_to_scan[0].name})
                 try:
                     heuristic_result = HeuristicAnalyzer.scan(str(files_to_scan[0]))
                     all_findings.extend(heuristic_result.get("findings", []))
                     malware_stats["heuristic_flags"] = heuristic_result.get("total_indicators", 0)
                     logger.info(f"🔍 Heuristic: {heuristic_result['total_indicators']} indicators")
+                    _log_audit(scan_id, "engine_completed", engine="heuristic", detail={
+                        "file": files_to_scan[0].name,
+                        "indicators": heuristic_result.get("total_indicators", 0),
+                    })
                 except Exception as e:
                     logger.error(f"Heuristic analysis error: {e}")
+                    _log_audit(scan_id, "error", engine="heuristic", detail={"error": str(e)})
+
+            # Malware Tier 2 — cloud intelligence (VirusTotal + AlienVault OTX)
+            if MALWARE_TIER2_AVAILABLE and (VIRUSTOTAL_API_KEY or OTX_API_KEY):
+                _log_audit(scan_id, "engine_started", engine="malware_tier2", detail={"file": files_to_scan[0].name})
+                try:
+                    tier2_scanner = MalwareTier2Scanner(
+                        virustotal_api_key=VIRUSTOTAL_API_KEY,
+                        otx_api_key=OTX_API_KEY,
+                    )
+                    tier2_result = tier2_scanner.scan_file(str(files_to_scan[0]))
+                    all_findings.extend(tier2_result.get("findings", []))
+                    malware_stats["tier2"] = tier2_result.get("summary", {})
+                    _log_audit(scan_id, "engine_completed", engine="malware_tier2", detail={
+                        "file": files_to_scan[0].name,
+                        "summary": tier2_result.get("summary", {}),
+                    })
+                except Exception as e:
+                    logger.error(f"Malware Tier 2 error: {e}")
+                    _log_audit(scan_id, "error", engine="malware_tier2", detail={"error": str(e)})
             
             files_scanned.append({"file": files_to_scan[0].name, "findings": len(all_findings)})
         else:
@@ -556,8 +633,10 @@ async def scan_code(files: List[UploadFile] = File(...)):
                 all_findings.extend(r["findings_list"])
         
         # AI analysis
+        _log_audit(scan_id, "engine_started", engine="gemini_ai")
         file_desc = ", ".join(uploaded_filenames) if len(uploaded_filenames) <= 3 else f"{uploaded_filenames[0]} + {len(uploaded_filenames)-1} more"
         ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), file_desc)
+        _log_audit(scan_id, "engine_completed", engine="gemini_ai", detail={"elapsed_s": round(ai_time, 2)})
         
         # Heatmap
         heatmap = generate_heatmap(all_findings)
@@ -610,8 +689,14 @@ async def scan_code(files: List[UploadFile] = File(...)):
                     "result_data": result,
                 }).execute()
                 logger.info(f"✅ Scan {scan_id} saved to Supabase")
+                _log_audit(scan_id, "scan_saved", detail={
+                    "total_findings": len(all_findings),
+                    "risk_score": result["ai_analysis"].get("risk_score"),
+                    "risk_level": result["ai_analysis"].get("risk_level"),
+                })
             except Exception as _e:
                 logger.warning(f"⚠️  Supabase save failed (non-critical): {_e}")
+                _log_audit(scan_id, "error", detail={"error": str(_e), "context": "scan_results_save"})
         logger.info(f"✅ Scan {scan_id}: {len(uploaded_filenames)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
         
         return JSONResponse(content=result)
@@ -620,6 +705,7 @@ async def scan_code(files: List[UploadFile] = File(...)):
         raise
     except Exception as e:
         logger.error(f"❌ Scan failed: {e}", exc_info=True)
+        _log_audit(scan_id, "error", detail={"error": str(e), "context": "scan_failed"})
         raise HTTPException(500, str(e))
     finally:
         shutil.rmtree(scan_dir, ignore_errors=True)
@@ -711,6 +797,8 @@ if __name__ == "__main__":
     print(f"🦠 Malware Detection: {'✅' if malware_scanner else '❌'}")
     print(f"🔍 YARA Rules: {'✅' if MALWARE_DETECTION_AVAILABLE else '❌'}")
     print(f"☁️  VirusTotal: {'✅' if VIRUSTOTAL_API_KEY else '❌ (optional)'}")
+    print(f"🌐 AlienVault OTX: {'✅' if OTX_API_KEY else '❌ (optional)'}")
+    print(f"🔒 Audit Logs: {'✅ Supabase' if supabase_db else '⚠️  Supabase not configured'}")
     print(f"📁 Multi-File + Multi-Format: ✅")
     print(f"🎯 Trust Engine for AI Systems")
     print("="*80)
