@@ -11,15 +11,17 @@ import uuid
 import asyncio
 import re
 import time
+import hashlib
+import threading
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from openai import OpenAI
 
 # Supabase client for persistent scan storage
@@ -130,6 +132,133 @@ class PerformanceMetrics:
         }
 
 metrics = PerformanceMetrics()
+
+# ── Immutable Audit Log ──────────────────────────────────────────────────────
+class ImmutableAuditLog:
+    """
+    Append-only, cryptographically hash-chained audit log.
+    Each entry stores the SHA-256 hash of the previous entry so the chain
+    can be independently verified and any tampering detected.
+    """
+
+    GENESIS_HASH = hashlib.sha256(b"ATLAS_SYNAPSE_GENESIS_BLOCK_v3.1").hexdigest()
+
+    def __init__(self, log_path: str = "audit_log.jsonl"):
+        self._log_path = Path(log_path)
+        self._lock = threading.Lock()
+        self._last_hash, self._seq = self._load_tail()
+        logger.info(f"📋 Audit log initialised — {self._seq} existing entries at {self._log_path}")
+
+    # ── private helpers ──────────────────────────────────────────────────────
+
+    def _load_tail(self):
+        """Read the tail of an existing log to initialise state."""
+        if not self._log_path.exists():
+            return self.GENESIS_HASH, 0
+        last_hash, seq = self.GENESIS_HASH, 0
+        try:
+            with open(self._log_path, "r", encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                        last_hash = entry.get("entry_hash", last_hash)
+                        seq = entry.get("seq", seq)
+                    except json.JSONDecodeError:
+                        pass
+        except OSError as exc:
+            logger.warning(f"Could not read audit log: {exc}")
+        return last_hash, seq
+
+    @staticmethod
+    def _hash_entry(entry: dict) -> str:
+        """Produce a deterministic SHA-256 hash of an entry (without entry_hash field)."""
+        canonical = json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    def append(self, event_type: str, data: dict) -> dict:
+        """Append an immutable entry and return it (including its hash)."""
+        with self._lock:
+            self._seq += 1
+            entry: dict = {
+                "seq": self._seq,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event_type": event_type,
+                "data": data,
+                "prev_hash": self._last_hash,
+            }
+            entry["entry_hash"] = self._hash_entry(entry)
+            try:
+                with open(self._log_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry) + "\n")
+            except OSError as exc:
+                logger.error(f"Audit log write failed: {exc}")
+                return entry
+            self._last_hash = entry["entry_hash"]
+            return entry
+
+    def get_entries(self, limit: int = 100, offset: int = 0):
+        """Return (entries, total) — entries are newest-first with pagination."""
+        entries: List[dict] = []
+        if not self._log_path.exists():
+            return entries, 0
+        try:
+            with open(self._log_path, "r", encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if raw:
+                        try:
+                            entries.append(json.loads(raw))
+                        except json.JSONDecodeError:
+                            pass
+        except OSError as exc:
+            logger.error(f"Audit log read failed: {exc}")
+            return entries, 0
+        total = len(entries)
+        # Newest first
+        entries = list(reversed(entries))
+        return entries[offset: offset + limit], total
+
+    def verify_chain(self) -> dict:
+        """
+        Walk the entire log and verify the hash chain.
+        Returns a dict with keys: valid (bool), entries_checked (int), broken_at_seq (int|None).
+        """
+        if not self._log_path.exists():
+            return {"valid": True, "entries_checked": 0, "broken_at_seq": None}
+        prev_hash = self.GENESIS_HASH
+        checked = 0
+        try:
+            with open(self._log_path, "r", encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    stored_hash = entry.pop("entry_hash", None)
+                    if entry.get("prev_hash") != prev_hash:
+                        return {"valid": False, "entries_checked": checked, "broken_at_seq": entry.get("seq")}
+                    recomputed = self._hash_entry(entry)
+                    if recomputed != stored_hash:
+                        return {"valid": False, "entries_checked": checked, "broken_at_seq": entry.get("seq")}
+                    prev_hash = stored_hash
+                    entry["entry_hash"] = stored_hash  # restore
+                    checked += 1
+        except OSError as exc:
+            logger.error(f"Audit log verification failed: {exc}")
+            return {"valid": False, "entries_checked": checked, "broken_at_seq": None}
+        return {"valid": True, "entries_checked": checked, "broken_at_seq": None}
+
+
+# Global audit log instance
+audit_log = ImmutableAuditLog(log_path=os.getenv("AUDIT_LOG_PATH", "audit_log.jsonl"))
 
 # Scanners
 class SemgrepScanner:
@@ -612,6 +741,25 @@ async def scan_code(files: List[UploadFile] = File(...)):
                 logger.info(f"✅ Scan {scan_id} saved to Supabase")
             except Exception as _e:
                 logger.warning(f"⚠️  Supabase save failed (non-critical): {_e}")
+
+        # ── Write immutable audit log entry ──────────────────────────────────
+        findings_hash = hashlib.sha256(
+            json.dumps(all_findings, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        audit_log.append("scan_completed", {
+            "scan_id": scan_id,
+            "file_desc": file_desc,
+            "files_uploaded": len(uploaded_filenames),
+            "files_scanned": len(files_to_scan),
+            "total_findings": len(all_findings),
+            "severity_breakdown": sev_breakdown,
+            "risk_score": ai_analysis.get("risk_score"),
+            "risk_level": ai_analysis.get("risk_level"),
+            "malware_detected": malware_stats.get("total_detections", 0) > 0,
+            "findings_hash": findings_hash,
+            "duration_seconds": round(total_time, 2),
+        })
+
         logger.info(f"✅ Scan {scan_id}: {len(uploaded_filenames)} uploads, {len(files_to_scan)} scanned, {len(all_findings)} findings")
         
         return JSONResponse(content=result)
@@ -695,6 +843,182 @@ async def list_frameworks():
         "frameworks": [{"id": k, "name": v.get("name", k)} for k, v in ComplianceMapper.FRAMEWORKS.items()],
         "total": len(ComplianceMapper.FRAMEWORKS)
     })
+
+# ── Immutable Audit Log endpoints ────────────────────────────────────────────
+
+@app.get("/api/audit-log")
+async def get_audit_log(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Return paginated immutable audit log entries (newest first)."""
+    entries, total = audit_log.get_entries(limit=limit, offset=offset)
+    return JSONResponse(content={
+        "entries": entries,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })
+
+@app.get("/api/audit-log/verify")
+async def verify_audit_log():
+    """Verify the cryptographic integrity of the entire audit log chain."""
+    result = audit_log.verify_chain()
+    status_code = 200 if result["valid"] else 409
+    return JSONResponse(content=result, status_code=status_code)
+
+# ── CI/CD Plugin endpoints ────────────────────────────────────────────────────
+
+_GITHUB_ACTIONS_TEMPLATE = """\
+# Atlas Synapse Aegis Prime Auditor — GitHub Actions CI plugin
+# Add this file to .github/workflows/aegis-security-scan.yml in your repository.
+name: Aegis Security Scan
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  aegis-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Aegis Prime Auditor
+        id: scan
+        env:
+          AEGIS_BACKEND: ${{ secrets.AEGIS_BACKEND_URL }}
+        run: |
+          RESULT=$(curl -s -X POST "$AEGIS_BACKEND/api/scan" \\
+            $(find . -name "*.py" -o -name "*.js" -o -name "*.ts" | head -20 | xargs -I{} sh -c 'echo "-F files=@{}"') \\
+            -w "\\nHTTP_%{http_code}")
+          HTTP_CODE=$(echo "$RESULT" | tail -1 | sed 's/HTTP_//')
+          BODY=$(echo "$RESULT" | head -n -1)
+          echo "scan_result=$BODY" >> $GITHUB_OUTPUT
+          RISK=$(echo "$BODY" | jq -r '.ai_analysis.risk_level // "UNKNOWN"')
+          SCORE=$(echo "$BODY" | jq -r '.ai_analysis.risk_score // 0')
+          echo "risk_level=$RISK" >> $GITHUB_OUTPUT
+          echo "risk_score=$SCORE" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const risk  = '${{ steps.scan.outputs.risk_level }}';
+            const score = '${{ steps.scan.outputs.risk_score }}';
+            const emoji = risk === 'CRITICAL' ? '🔴' : risk === 'HIGH' ? '🟠' : risk === 'MEDIUM' ? '🟡' : '🟢';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${emoji} Aegis Security Scan\\n**Risk:** ${risk} (${score}/100)\\n\\n*Powered by Atlas Synapse Aegis Prime Auditor*`
+            });
+"""
+
+_GITLAB_CI_TEMPLATE = """\
+# Atlas Synapse Aegis Prime Auditor — GitLab CI plugin
+# Merge this block into your .gitlab-ci.yml
+
+aegis-security-scan:
+  stage: test
+  image: python:3.12-slim
+  before_script:
+    - pip install httpie --quiet
+  script:
+    - >
+      http --ignore-stdin POST "$AEGIS_BACKEND_URL/api/scan"
+      $(find . -name "*.py" -o -name "*.js" -o -name "*.ts" | head -20 |
+        xargs -I{} sh -c 'printf "files@{}\\n"') > scan_result.json
+    - RISK=$(jq -r '.ai_analysis.risk_level // "UNKNOWN"' scan_result.json)
+    - SCORE=$(jq -r '.ai_analysis.risk_score // 0' scan_result.json)
+    - echo "Risk level $RISK ($SCORE/100)"
+    - if [ "$RISK" = "CRITICAL" ]; then exit 1; fi
+  artifacts:
+    paths:
+      - scan_result.json
+    expire_in: 7 days
+  variables:
+    AEGIS_BACKEND_URL: ""   # Set this in GitLab CI/CD Variables
+"""
+
+_JENKINS_TEMPLATE = """\
+// Atlas Synapse Aegis Prime Auditor — Jenkins Pipeline plugin
+// Add this stage to your Jenkinsfile
+
+stage('Aegis Security Scan') {
+    steps {
+        script {
+            def backendUrl = env.AEGIS_BACKEND_URL ?: 'http://localhost:10000'
+            def files = sh(
+                script: "find . -name '*.py' -o -name '*.js' -o -name '*.ts' | head -20",
+                returnStdout: true
+            ).trim().split('\\n')
+
+            def formArgs = files.collect { "-F 'files=@${it}'" }.join(' ')
+
+            def response = sh(
+                script: "curl -s -X POST '${backendUrl}/api/scan' ${formArgs}",
+                returnStdout: true
+            )
+            def result = readJSON text: response
+
+            def riskLevel = result.ai_analysis?.risk_level ?: 'UNKNOWN'
+            def riskScore = result.ai_analysis?.risk_score ?: 0
+
+            echo "Aegis Scan — Risk: ${riskLevel} (${riskScore}/100)"
+            currentBuild.description = "Aegis: ${riskLevel} ${riskScore}/100"
+
+            if (riskLevel == 'CRITICAL') {
+                error("CRITICAL security risk detected by Aegis. Build blocked.")
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'aegis-scan-*.json', allowEmptyArchive: true
+        }
+    }
+}
+"""
+
+
+@app.get("/api/ci-cd/github-actions", response_class=PlainTextResponse)
+async def cicd_github_actions():
+    """Return a ready-to-use GitHub Actions workflow YAML for Aegis scans."""
+    return PlainTextResponse(content=_GITHUB_ACTIONS_TEMPLATE, media_type="text/yaml")
+
+
+@app.get("/api/ci-cd/gitlab-ci", response_class=PlainTextResponse)
+async def cicd_gitlab_ci():
+    """Return a ready-to-use GitLab CI job block for Aegis scans."""
+    return PlainTextResponse(content=_GITLAB_CI_TEMPLATE, media_type="text/yaml")
+
+
+@app.get("/api/ci-cd/jenkins", response_class=PlainTextResponse)
+async def cicd_jenkins():
+    """Return a ready-to-use Jenkins Pipeline stage for Aegis scans."""
+    return PlainTextResponse(content=_JENKINS_TEMPLATE, media_type="text/plain")
+
+
+@app.get("/api/ci-cd")
+async def cicd_index():
+    """List available CI/CD plugin templates."""
+    return JSONResponse(content={
+        "plugins": [
+            {"name": "GitHub Actions", "endpoint": "/api/ci-cd/github-actions", "format": "yaml"},
+            {"name": "GitLab CI",      "endpoint": "/api/ci-cd/gitlab-ci",      "format": "yaml"},
+            {"name": "Jenkins",        "endpoint": "/api/ci-cd/jenkins",         "format": "groovy"},
+        ]
+    })
+
 
 if __name__ == "__main__":
     import uvicorn
