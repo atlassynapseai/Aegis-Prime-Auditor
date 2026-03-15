@@ -12,7 +12,10 @@ import asyncio
 import re
 import time
 import logging
-from datetime import datetime
+import hashlib
+import hmac
+import threading
+from datetime import datetime, timezone
 from typing import List, Dict, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -130,6 +133,77 @@ class PerformanceMetrics:
         }
 
 metrics = PerformanceMetrics()
+
+
+# Immutable Audit Log (append-only, SHA-256 hash-chained)
+class ImmutableAuditLog:
+    """Tamper-evident audit log using a SHA-256 hash chain.
+
+    Each entry stores a SHA-256 digest of its own payload combined with the
+    previous entry's digest, forming a chain.  Any post-hoc modification of an
+    entry will break the chain and be detected by :meth:`verify`.
+    """
+
+    _GENESIS_HASH = "0" * 64  # seed hash for the first entry
+
+    def __init__(self):
+        self._entries: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _hash_entry(payload: Dict[str, Any], prev_hash: str) -> str:
+        """Return the SHA-256 hex-digest of ``prev_hash + canonical JSON(payload)``."""
+        canonical = prev_hash + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def append(self, scan_id: str, event: str, details: Dict[str, Any]) -> Dict[str, Any]:
+        """Append a new audit entry and return it."""
+        with self._lock:
+            prev_hash = self._entries[-1]["entry_hash"] if self._entries else self._GENESIS_HASH
+            payload = {
+                "seq": len(self._entries),
+                "scan_id": scan_id,
+                "event": event,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "details": details,
+            }
+            entry_hash = self._hash_entry(payload, prev_hash)
+            entry = {**payload, "prev_hash": prev_hash, "entry_hash": entry_hash}
+            self._entries.append(entry)
+            return entry
+
+    def get_all(self) -> List[Dict[str, Any]]:
+        """Return a snapshot of all audit entries."""
+        with self._lock:
+            return list(self._entries)
+
+    def verify(self) -> Dict[str, Any]:
+        """Verify the integrity of the entire chain.
+
+        Returns a dict with ``valid`` (bool), ``total`` entry count, and, if
+        invalid, the ``first_broken_seq`` index where the chain was broken.
+        """
+        with self._lock:
+            entries = list(self._entries)
+
+        prev_hash = self._GENESIS_HASH
+        for entry in entries:
+            payload = {k: entry[k] for k in ("seq", "scan_id", "event", "timestamp", "details")}
+            expected = self._hash_entry(payload, prev_hash)
+            if not hmac.compare_digest(expected, entry["entry_hash"]):
+                return {"valid": False, "total": len(entries), "first_broken_seq": entry["seq"]}
+            prev_hash = entry["entry_hash"]
+
+        return {"valid": True, "total": len(entries)}
+
+
+audit_log = ImmutableAuditLog()
 
 # Scanners
 class SemgrepScanner:
@@ -596,6 +670,22 @@ async def scan_code(files: List[UploadFile] = File(...)):
         }
         
         SCAN_RESULTS_STORE[scan_id] = result
+
+        # Immutable audit log entry
+        audit_log.append(
+            scan_id=scan_id,
+            event="scan_completed",
+            details={
+                "files": uploaded_filenames,
+                "total_findings": len(all_findings),
+                "risk_score": result["ai_analysis"].get("risk_score"),
+                "risk_level": result["ai_analysis"].get("risk_level"),
+                "malware_detected": bool(
+                    result.get("malware_detection") and
+                    result["malware_detection"].get("total_detections", 0) > 0
+                ),
+            },
+        )
         
         # Persist to Supabase (user_id null until user claims after signup)
         if supabase_db:
@@ -656,6 +746,26 @@ async def list_scans(limit: int = Query(20, ge=1, le=100), offset: int = Query(0
 @app.get("/api/metrics")
 async def get_metrics():
     return JSONResponse(content=metrics.stats())
+
+
+@app.get("/api/audit-log")
+async def get_audit_log(limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
+    """Return paginated immutable audit log entries (newest first)."""
+    entries = audit_log.get_all()
+    entries_desc = list(reversed(entries))
+    return JSONResponse(content={
+        "entries": entries_desc[offset:offset + limit],
+        "total": len(entries),
+    })
+
+
+@app.get("/api/audit-log/verify")
+async def verify_audit_log():
+    """Verify the cryptographic integrity of the entire audit log chain."""
+    result = audit_log.verify()
+    status_code = 200 if result["valid"] else 409
+    return JSONResponse(content=result, status_code=status_code)
+
 
 @app.get("/api/scan/{scan_id}/sbom")
 async def get_sbom(scan_id: str):
