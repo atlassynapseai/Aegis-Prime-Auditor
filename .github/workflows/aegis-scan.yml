@@ -1,3 +1,13 @@
+# Atlas Synapse Security Scan — GitHub Actions Workflow
+# Scans code and blocks merge on critical security issues
+#
+# Setup Instructions:
+# 1. Copy this file to: .github/workflows/atlas-security-scan.yml
+# 2. Go to Settings → Secrets and variables → Actions
+# 3. Add secret: AEGIS_BACKEND_URL
+#    Example: https://your-codespace-8000.app.github.dev
+# 4. (Optional) Add secret: AEGIS_API_KEY if your backend requires authentication
+
 name: Atlas Synapse Security Scan
 
 on:
@@ -18,186 +28,156 @@ permissions:
 jobs:
   security-scan:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 10
+
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
-      
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      
-      - name: Install Dependencies
-        run: |
-          cd backend
-          pip install fastapi uvicorn openai python-multipart --quiet
-          pip install semgrep --quiet
-      
-      - name: Create Required Modules
-        run: |
-          cd backend
-          
-          # Create minimal background_processor.py
-          cat > background_processor.py << 'EOF'
-class FilePrioritizer:
-    @classmethod
-    def filter_scannable(cls, files, max_files=15):
-        return files[:max_files]
 
-class BackgroundScanManager:
-    def __init__(self):
-        self.tasks = {}
-    def get_status(self, scan_id):
-        return {"status": "not_found"}
-
-background_manager = BackgroundScanManager()
-EOF
-          
-          # Create minimal file_parsers.py
-          cat > file_parsers.py << 'EOF'
-from pathlib import Path
-
-class FileParser:
-    @staticmethod
-    def get_scannable_content(path):
-        try:
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                return f.read()
-        except:
-            return ""
-EOF
-          
-          # Create minimal sbom_compliance.py
-          cat > sbom_compliance.py << 'EOF'
-class SBOMGenerator:
-    @staticmethod
-    def generate(scan_result):
-        return {"bomFormat": "CycloneDX", "components": []}
-
-class ComplianceMapper:
-    FRAMEWORKS = {}
-    @staticmethod
-    def map_findings_to_compliance(findings):
-        return {"frameworks": {}, "overall_status": {}}
-EOF
-          
-          # Create minimal pdf_generator.py
-          cat > pdf_generator.py << 'EOF'
-class ReportGenerator:
-    @staticmethod
-    def generate_executive_markdown(scan, compliance):
-        return "# Report"
-    @staticmethod
-    def generate_html_report(scan, compliance):
-        return "<html><body>Report</body></html>"
-EOF
-      
-      - name: Run Security Scan on Test Files
+      - name: Run Aegis Security Scan
+        id: scan
         env:
-          OPENAI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENAI_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai/
+          AEGIS_BACKEND_URL: ${{ secrets.AEGIS_BACKEND_URL }}
+          AEGIS_API_KEY: ${{ secrets.AEGIS_API_KEY }}
         run: |
-          cd backend
-          python orchestrator.py &
-          BACKEND_PID=$!
-          
-          sleep 12
-          
-          # Test health endpoint
-          curl http://localhost:10000/ -s || echo "Backend starting..."
-          sleep 3
-          
-          # Scan test files only
-          cd ../tests
-          for file in *.py; do
-            if [ -f "$file" ]; then
-              echo "Scanning: $file"
-              curl -X POST http://localhost:10000/api/scan \
-                -F "file=@$file" \
-                -o "../scan_$file.json" \
-                -s || true
-            fi
-          done
-          
-          cd ..
-          kill $BACKEND_PID 2>/dev/null || true
-          sleep 2
-      
-      - name: Analyze Results
-        id: analyze
-        run: |
-          TOTAL=0
-          CRIT=0
-          HIGH=0
-          
-          for f in scan_*.json; do
-            if [ -f "$f" ] && [ -s "$f" ]; then
-              T=$(jq -r '.total_findings // 0' "$f" 2>/dev/null || echo 0)
-              C=$(jq -r '.severity_breakdown.CRITICAL // 0' "$f" 2>/dev/null || echo 0)
-              H=$(jq -r '.severity_breakdown.HIGH // 0' "$f" 2>/dev/null || echo 0)
-              
-              TOTAL=$((TOTAL + T))
-              CRIT=$((CRIT + C))
-              HIGH=$((HIGH + H))
-            fi
-          done
-          
-          echo "total_findings=$TOTAL" >> $GITHUB_OUTPUT
-          echo "critical=$CRIT" >> $GITHUB_OUTPUT
-          echo "high=$HIGH" >> $GITHUB_OUTPUT
-          
-          if [ $CRIT -gt 0 ]; then
-            echo "status=FAILED" >> $GITHUB_OUTPUT
-          elif [ $HIGH -gt 3 ]; then
-            echo "status=WARNING" >> $GITHUB_OUTPUT
-          else
-            echo "status=PASSED" >> $GITHUB_OUTPUT
+          # Validate backend URL is configured
+          if [ -z "$AEGIS_BACKEND_URL" ]; then
+            echo "❌ AEGIS_BACKEND_URL secret not set"
+            echo "Configure in Settings → Secrets and variables → Actions"
+            exit 1
           fi
-          
-          echo "## Scan Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- Total Findings: $TOTAL" >> $GITHUB_STEP_SUMMARY
-          echo "- Critical: $CRIT" >> $GITHUB_STEP_SUMMARY
-          echo "- High: $HIGH" >> $GITHUB_STEP_SUMMARY
-      
+
+          # Check backend is reachable
+          if ! curl -m 10 -s "$AEGIS_BACKEND_URL/" > /dev/null 2>&1; then
+            echo "❌ Backend unreachable at: $AEGIS_BACKEND_URL"
+            exit 1
+          fi
+
+          # Find scannable files (limit to 25 to avoid timeouts)
+          FILES=$(find . \
+            -type f \( \
+              -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.tsx" \
+              -o -name "*.java" -o -name "*.go" -o -name "*.rs" \
+            \) \
+            -not -path "*/node_modules/*" \
+            -not -path "*/.git/*" \
+            -not -path "*/dist/*" \
+            -not -path "*/build/*" \
+            2>/dev/null | head -25)
+
+          if [ -z "$FILES" ]; then
+            echo "⚠️  No scannable files found"
+            echo "risk_level=UNKNOWN" >> $GITHUB_OUTPUT
+            echo "risk_score=0" >> $GITHUB_OUTPUT
+            echo "total_findings=0" >> $GITHUB_OUTPUT
+            echo "critical_count=0" >> $GITHUB_OUTPUT
+            echo "high_count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Build curl multipart form data
+          CURL_ARGS=""
+          for file in $FILES; do
+            CURL_ARGS="$CURL_ARGS -F files=@$file"
+          done
+
+          # Call Aegis backend API
+          RESPONSE=$(curl -s -X POST \
+            -H "X-API-Key: ${AEGIS_API_KEY:-}" \
+            $CURL_ARGS \
+            "$AEGIS_BACKEND_URL/api/scan" \
+            -w "\n%{http_code}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          # Check HTTP response
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Scan failed (HTTP $HTTP_CODE)"
+            echo "$BODY" | head -20
+            exit 1
+          fi
+
+          # Save results
+          echo "$BODY" > scan_result.json
+
+          # Parse JSON response
+          if command -v jq &> /dev/null; then
+            RISK=$(echo "$BODY" | jq -r '.ai_analysis.risk_level // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+            SCORE=$(echo "$BODY" | jq -r '.ai_analysis.risk_score // 0' 2>/dev/null || echo "0")
+            TOTAL=$(echo "$BODY" | jq -r '.total_findings // 0' 2>/dev/null || echo "0")
+            CRITICAL=$(echo "$BODY" | jq -r '.severity_breakdown.CRITICAL // 0' 2>/dev/null || echo "0")
+            HIGH=$(echo "$BODY" | jq -r '.severity_breakdown.HIGH // 0' 2>/dev/null || echo "0")
+          else
+            RISK="UNKNOWN"
+            SCORE="0"
+            TOTAL="0"
+            CRITICAL="0"
+            HIGH="0"
+          fi
+
+          # Set outputs for next steps
+          echo "risk_level=$RISK" >> $GITHUB_OUTPUT
+          echo "risk_score=$SCORE" >> $GITHUB_OUTPUT
+          echo "total_findings=$TOTAL" >> $GITHUB_OUTPUT
+          echo "critical_count=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high_count=$HIGH" >> $GITHUB_OUTPUT
+
+          # Log summary
+          echo "✅ Scan Complete"
+          echo "Risk: $RISK ($SCORE/100)"
+          echo "Findings: $TOTAL (Critical: $CRITICAL, High: $HIGH)"
+
       - name: Comment on PR
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.scan.outcome == 'success'
         uses: actions/github-script@v7
         with:
           script: |
-            const total = '${{ steps.analyze.outputs.total_findings }}';
-            const critical = '${{ steps.analyze.outputs.critical }}';
-            const high = '${{ steps.analyze.outputs.high }}';
-            const status = '${{ steps.analyze.outputs.status }}';
-            
-            const statusEmoji = status === 'PASSED' ? '✅' : status === 'WARNING' ? '⚠️' : '❌';
-            
-            const comment = `## ${statusEmoji} Atlas Synapse Security Scan Results
+            const risk = '${{ steps.scan.outputs.risk_level }}';
+            const score = '${{ steps.scan.outputs.risk_score }}';
+            const total = '${{ steps.scan.outputs.total_findings }}';
+            const critical = '${{ steps.scan.outputs.critical_count }}';
+            const high = '${{ steps.scan.outputs.high_count }}';
 
-**Status:** ${status}  
-**Total Findings:** ${total}  
-**Critical:** ${critical}  
-**High:** ${high}
+            const emoji = risk === 'CRITICAL' ? '🔴' :
+                         risk === 'HIGH' ? '🟠' :
+                         risk === 'MEDIUM' ? '🟡' : '🟢';
 
-${critical > 0 ? '⛔ **CRITICAL vulnerabilities must be remediated before merge**' : ''}
-${high > 3 ? '⚠️ **HIGH severity issues require review**' : ''}
-${status === 'PASSED' ? '🎉 **No critical security issues detected**' : ''}
+            const body = `## ${emoji} Atlas Synapse Security Scan
+
+| Metric | Value |
+|--------|-------|
+| **Risk Level** | ${risk} |
+| **Risk Score** | ${score}/100 |
+| **Total Findings** | ${total} |
+| **Critical** | ${critical} |
+| **High** | ${high} |
+
+${critical > 0 ? '⛔ **CRITICAL issues must be fixed before merge**' : ''}
+${high > 0 && critical == 0 ? '⚠️ **HIGH severity issues require review**' : ''}
+${critical == 0 && high == 0 ? '✅ **No critical security issues detected**' : ''}
 
 ---
-*Powered by Atlas Synapse Auditor v3.0 • Trust Engine for AI Systems*`;
-            
+*Powered by Atlas Synapse Auditor • Trust Engine for AI Systems*`;
+
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: comment
+              body: body
             });
-      
-      - name: Upload Results
+
+      - name: Block Merge on Critical Risk
+        if: steps.scan.outputs.risk_level == 'CRITICAL' || steps.scan.outputs.critical_count > 0
+        run: |
+          echo "❌ Build blocked: CRITICAL security risks detected"
+          exit 1
+
+      - name: Upload Scan Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: atlas-security-scan-results
-          path: scan_*.json
+          path: scan_result.json
           retention-days: 30
           if-no-files-found: ignore
