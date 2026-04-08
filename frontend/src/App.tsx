@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import './App.css'
+import { IrisGlobalChatbot } from './components/IrisGlobalChatbot'
 
 interface Finding {
   id: string; engine: string; category: string; severity: string; message: string
@@ -951,6 +952,8 @@ function App() {
           </div>
         </div>
       </footer>
+
+      <IrisGlobalChatbot />
     </div>
   )
 }
