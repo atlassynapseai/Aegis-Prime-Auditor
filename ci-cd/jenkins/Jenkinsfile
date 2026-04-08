@@ -1,37 +1,113 @@
 // Atlas Synapse Aegis Prime Auditor — Jenkins Pipeline plugin
 // Installation: Add this stage to your Jenkinsfile
+//
+// Setup:
+// 1. Go to Manage Jenkins → Credentials → System → Global credentials
+// 2. Add secret text: AEGIS_BACKEND_URL
+// 3. Add secret text: AEGIS_API_KEY (optional)
 
-stage('Aegis Security Scan') {
-    steps {
-        script {
-            def backendUrl = env.AEGIS_BACKEND_URL ?: 'http://localhost:10000'
-            def files = sh(
-                script: "find . -name '*.py' -o -name '*.js' -o -name '*.ts' | head -20",
-                returnStdout: true
-            ).trim().split('\n')
+pipeline {
+    agent any
 
-            def formArgs = files.collect { "-F 'files=@${it}'" }.join(' ')
+    stages {
+        stage('Aegis Security Scan') {
+            environment {
+                AEGIS_BACKEND_URL = credentials('AEGIS_BACKEND_URL')
+                AEGIS_API_KEY = credentials('AEGIS_API_KEY')
+            }
 
-            def response = sh(
-                script: "curl -s -X POST '${backendUrl}/api/scan' ${formArgs}",
-                returnStdout: true
-            )
-            def result = readJSON text: response
+            steps {
+                script {
+                    sh '''
+                        # Check backend health
+                        if ! curl -m 10 -s "${AEGIS_BACKEND_URL}/" > /dev/null; then
+                            echo "❌ Backend unreachable at ${AEGIS_BACKEND_URL}"
+                            exit 1
+                        fi
 
-            def riskLevel = result.ai_analysis?.risk_level ?: 'UNKNOWN'
-            def riskScore = result.ai_analysis?.risk_score ?: 0
+                        # Collect files for scanning
+                        FILES=$(find . \\
+                            -type f \\
+                            -regex ".*/\\\\.*\\\\.\\\\(py\\\\|js\\\\|ts\\\\|tsx\\\\|java\\\\|go\\\\|rs\\\\|sh\\\\|yaml\\\\|yml\\\\)$" \\
+                            ! -path "*/node_modules/*" \\
+                            ! -path "*/.git/*" \\
+                            2>/dev/null | head -30)
 
-            echo "Aegis Scan — Risk: ${riskLevel} (${riskScore}/100)"
-            currentBuild.description = "Aegis: ${riskLevel} ${riskScore}/100"
+                        if [ -z "$FILES" ]; then
+                            echo "⚠️ No scannable files found"
+                            exit 0
+                        fi
 
-            if (riskLevel == 'CRITICAL') {
-                error("CRITICAL security risk detected by Aegis. Build blocked.")
+                        # Build form data
+                        FORM_DATA=""
+                        for file in $FILES; do
+                            FORM_DATA="$FORM_DATA -F files=@$file"
+                        done
+
+                        # Run Aegis scan
+                        curl -s -X POST \\
+                            -H "X-API-Key: ${AEGIS_API_KEY}" \\
+                            $FORM_DATA \\
+                            "${AEGIS_BACKEND_URL}/api/scan" \\
+                            -o scan_result.json
+
+                        # Parse and display results
+                        RISK=$(cat scan_result.json | grep -o '"risk_level":"[^"]*"' | cut -d'"' -f4 || echo "UNKNOWN")
+                        SCORE=$(cat scan_result.json | grep -o '"risk_score":[0-9]*' | cut -d':' -f2 || echo "0")
+
+                        echo ""
+                        echo "=========================================="
+                        echo "  AEGIS SECURITY SCAN RESULTS"
+                        echo "=========================================="
+                        echo "  Risk Level: $RISK"
+                        echo "  Risk Score: $SCORE/100"
+                        echo "=========================================="
+                        echo ""
+
+                        # Set build description
+                        currentBuild.description = "Aegis: ${RISK} (${SCORE}/100)"
+
+                        # Check for critical findings
+                        CRITICAL=$(cat scan_result.json | grep -c '"severity":"CRITICAL"' || echo "0")
+
+                        if [ "$CRITICAL" -gt 0 ]; then
+                            echo "❌ CRITICAL security issues detected: $CRITICAL"
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+
+            post {
+                always {
+                    // Archive scan results
+                    archiveArtifacts artifacts: 'scan_result.json',
+                                      allowEmptyArchive: true
+
+                    // Publish as test result if available
+                    script {
+                        if (fileExists('scan_result.json')) {
+                            sh 'cat scan_result.json'
+                        }
+                    }
+                }
+
+                failure {
+                    // Mark build as unstable instead of failed if needed
+                    script {
+                        if (env.RISK_LEVEL == 'HIGH') {
+                            unstable('HIGH risk findings require review')
+                        }
+                    }
+                }
             }
         }
     }
+
     post {
         always {
-            archiveArtifacts artifacts: 'aegis-scan-*.json', allowEmptyArchive: true
+            cleanWs()
         }
     }
 }
+

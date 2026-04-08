@@ -1,23 +1,83 @@
 # Atlas Synapse Aegis Prime Auditor — GitLab CI plugin
-# Installation: Merge this block into your .gitlab-ci.yml
+# Installation: Add this to your .gitlab-ci.yml
+#
+# Setup:
+# 1. Go to Settings → CI/CD → Variables
+# 2. Add: AEGIS_BACKEND_URL (e.g., https://your-codespace:8000)
+# 3. Add: AEGIS_API_KEY (optional)
 
 aegis-security-scan:
   stage: test
-  image: python:3.12-slim
-  before_script:
-    - pip install httpie --quiet
+  image: curlimages/curl:latest
+  timeout: 15 minutes
+
   script:
-    - >
-      http --ignore-stdin POST "$AEGIS_BACKEND_URL/api/scan"
-      $(find . -name "*.py" -o -name "*.js" -o -name "*.ts" | head -20 |
-        xargs -I{} sh -c 'printf "files@{}\\n"') > scan_result.json
-    - RISK=$(jq -r '.ai_analysis.risk_level // "UNKNOWN"' scan_result.json)
-    - SCORE=$(jq -r '.ai_analysis.risk_score // 0' scan_result.json)
-    - echo "Risk level $RISK ($SCORE/100)"
-    - if [ "$RISK" = "CRITICAL" ]; then exit 1; fi
+    # Check backend health
+    - |
+      if ! curl -m 10 -s "${AEGIS_BACKEND_URL}/" > /dev/null; then
+        echo "❌ Backend unreachable at ${AEGIS_BACKEND_URL}"
+        exit 1
+      fi
+
+    # Collect scannable files (limit to 30)
+    - |
+      FILES=$(find . \
+        -type f \
+        \( -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.tsx" \
+        -o -name "*.java" -o -name "*.go" -o -name "*.rs" \
+        -o -name "*.sh" -o -name "*.yaml" -o -name "*.yml" \) \
+        ! -path "*/node_modules/*" \
+        ! -path "*/.git/*" \
+        2>/dev/null | head -30)
+
+    - |
+      if [ -z "$FILES" ]; then
+        echo "⚠️ No scannable files found"
+        exit 0
+      fi
+
+    # Build curl form data
+    - |
+      FORM_DATA=""
+      for file in $FILES; do
+        FORM_DATA="$FORM_DATA -F files=@$file"
+      done
+
+    # Run scan
+    - |
+      curl -s -X POST \
+        -H "X-API-Key: ${AEGIS_API_KEY}" \
+        $FORM_DATA \
+        "${AEGIS_BACKEND_URL}/api/scan" \
+        -o scan_result.json
+
+    # Parse results
+    - |
+      RISK=$(cat scan_result.json | grep -o '"risk_level":"[^"]*"' | cut -d'"' -f4 || echo "UNKNOWN")
+      SCORE=$(cat scan_result.json | grep -o '"risk_score":[0-9]*' | cut -d':' -f2 || echo "0")
+      echo "Risk Level: $RISK (Score: $SCORE/100)"
+
+    # Check for critical findings
+    - |
+      CRITICAL=$(cat scan_result.json | grep -c '"severity":"CRITICAL"' || echo "0")
+      if [ "$CRITICAL" -gt 0 ]; then
+        echo "❌ CRITICAL security issues detected"
+        exit 1
+      fi
+
   artifacts:
+    name: "aegis-scan-$CI_COMMIT_SHORT_SHA"
     paths:
       - scan_result.json
-    expire_in: 7 days
+    expire_in: 30 days
+    when: always
+
+  allow_failure: false
+  retry:
+    max: 2
+    when: runner_system_failure
+
   variables:
-    AEGIS_BACKEND_URL: ""   # Set this in GitLab CI/CD Variables
+    AEGIS_BACKEND_URL: ""   # REQUIRED: Set in Settings → CI/CD → Variables
+    AEGIS_API_KEY: ""       # OPTIONAL: Set in Settings → CI/CD → Variables
+
