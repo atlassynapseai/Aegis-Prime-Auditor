@@ -1,0 +1,51 @@
+# Atlas Synapse Aegis Prime Auditor — GitHub Actions CI plugin
+# Installation: Copy this file to .github/workflows/aegis-security-scan.yml in your repository
+name: Aegis Security Scan
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  aegis-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Aegis Prime Auditor
+        id: scan
+        env:
+          AEGIS_BACKEND: ${{ secrets.AEGIS_BACKEND_URL }}
+        run: |
+          RESULT=$(curl -s -X POST "$AEGIS_BACKEND/api/scan" \
+            $(find . -name "*.py" -o -name "*.js" -o -name "*.ts" | head -20 | xargs -I{} sh -c 'echo "-F files=@{}"') \
+            -w "\nHTTP_%{http_code}")
+          HTTP_CODE=$(echo "$RESULT" | tail -1 | sed 's/HTTP_//')
+          BODY=$(echo "$RESULT" | head -n -1)
+          echo "scan_result=$BODY" >> $GITHUB_OUTPUT
+          RISK=$(echo "$BODY" | jq -r '.ai_analysis.risk_level // "UNKNOWN"')
+          SCORE=$(echo "$BODY" | jq -r '.ai_analysis.risk_score // 0')
+          echo "risk_level=$RISK" >> $GITHUB_OUTPUT
+          echo "risk_score=$SCORE" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const risk  = '${{ steps.scan.outputs.risk_level }}';
+            const score = '${{ steps.scan.outputs.risk_score }}';
+            const emoji = risk === 'CRITICAL' ? '🔴' : risk === 'HIGH' ? '🟠' : risk === 'MEDIUM' ? '🟡' : '🟢';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${emoji} Aegis Security Scan\n**Risk:** ${risk} (${score}/100)\n\n*Powered by Atlas Synapse Aegis Prime Auditor*`
+            });

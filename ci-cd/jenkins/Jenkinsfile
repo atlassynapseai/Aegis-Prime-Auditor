@@ -1,0 +1,37 @@
+// Atlas Synapse Aegis Prime Auditor — Jenkins Pipeline plugin
+// Installation: Add this stage to your Jenkinsfile
+
+stage('Aegis Security Scan') {
+    steps {
+        script {
+            def backendUrl = env.AEGIS_BACKEND_URL ?: 'http://localhost:10000'
+            def files = sh(
+                script: "find . -name '*.py' -o -name '*.js' -o -name '*.ts' | head -20",
+                returnStdout: true
+            ).trim().split('\n')
+
+            def formArgs = files.collect { "-F 'files=@${it}'" }.join(' ')
+
+            def response = sh(
+                script: "curl -s -X POST '${backendUrl}/api/scan' ${formArgs}",
+                returnStdout: true
+            )
+            def result = readJSON text: response
+
+            def riskLevel = result.ai_analysis?.risk_level ?: 'UNKNOWN'
+            def riskScore = result.ai_analysis?.risk_score ?: 0
+
+            echo "Aegis Scan — Risk: ${riskLevel} (${riskScore}/100)"
+            currentBuild.description = "Aegis: ${riskLevel} ${riskScore}/100"
+
+            if (riskLevel == 'CRITICAL') {
+                error("CRITICAL security risk detected by Aegis. Build blocked.")
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: 'aegis-scan-*.json', allowEmptyArchive: true
+        }
+    }
+}

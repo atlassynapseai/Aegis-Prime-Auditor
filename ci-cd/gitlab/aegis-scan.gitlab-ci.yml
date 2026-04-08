@@ -1,0 +1,23 @@
+# Atlas Synapse Aegis Prime Auditor — GitLab CI plugin
+# Installation: Merge this block into your .gitlab-ci.yml
+
+aegis-security-scan:
+  stage: test
+  image: python:3.12-slim
+  before_script:
+    - pip install httpie --quiet
+  script:
+    - >
+      http --ignore-stdin POST "$AEGIS_BACKEND_URL/api/scan"
+      $(find . -name "*.py" -o -name "*.js" -o -name "*.ts" | head -20 |
+        xargs -I{} sh -c 'printf "files@{}\\n"') > scan_result.json
+    - RISK=$(jq -r '.ai_analysis.risk_level // "UNKNOWN"' scan_result.json)
+    - SCORE=$(jq -r '.ai_analysis.risk_score // 0' scan_result.json)
+    - echo "Risk level $RISK ($SCORE/100)"
+    - if [ "$RISK" = "CRITICAL" ]; then exit 1; fi
+  artifacts:
+    paths:
+      - scan_result.json
+    expire_in: 7 days
+  variables:
+    AEGIS_BACKEND_URL: ""   # Set this in GitLab CI/CD Variables

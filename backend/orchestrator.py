@@ -192,14 +192,39 @@ class ImmutableAuditLog:
                 "prev_hash": self._last_hash,
             }
             entry["entry_hash"] = self._hash_entry(entry)
+
+            # Write to local file
             try:
                 with open(self._log_path, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(entry) + "\n")
             except OSError as exc:
                 logger.error(f"Audit log write failed: {exc}")
                 return entry
+
+            # Sync to Supabase for SOC 2 compliance
+            self._sync_to_supabase(entry)
+
             self._last_hash = entry["entry_hash"]
             return entry
+
+    def _sync_to_supabase(self, entry: dict) -> bool:
+        """Sync audit log entry to Supabase (non-blocking, failures are logged but not fatal)."""
+        if not supabase_db:
+            return False
+
+        try:
+            supabase_db.table("audit_logs").insert({
+                "seq": entry["seq"],
+                "timestamp": entry["timestamp"],
+                "event_type": entry["event_type"],
+                "data": entry["data"],
+                "entry_hash": entry["entry_hash"],
+                "prev_hash": entry["prev_hash"]
+            }).execute()
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ Supabase audit sync failed (will retry): {e}")
+            return False
 
     def get_entries(self, limit: int = 100, offset: int = 0):
         """Return (entries, total) — entries are newest-first with pagination."""
