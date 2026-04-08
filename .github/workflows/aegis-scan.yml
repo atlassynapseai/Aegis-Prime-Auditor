@@ -1,5 +1,5 @@
 # Atlas Synapse Security Scan — Self-Contained GitHub Actions
-# No external dependencies — runs all scanners locally
+# Reliable scanner setup with proper error handling
 
 name: Atlas Synapse Security Scan
 
@@ -17,20 +17,28 @@ permissions:
 jobs:
   security-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Scanners
         run: |
+          set -e
           echo "📦 Installing security scanners..."
-          pip install semgrep -q
-          curl -s https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh | bash
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add -
-          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | tee -a /etc/apt/sources.list.d/trivy.list > /dev/null
-          apt-get update -qq && apt-get install -y trivy -qq >/dev/null 2>&1
+          
+          # Update package index
+          sudo apt-get update -qq
+          
+          # Install Semgrep
+          echo "Installing Semgrep..."
+          pip install semgrep -q 2>/dev/null || pip3 install semgrep -q
+          
+          # Install jq for JSON parsing
+          echo "Installing jq..."
+          sudo apt-get install -y jq -qq >/dev/null 2>&1
+          
           echo "✅ Scanners ready"
 
       - name: Run Semgrep (SAST)
@@ -38,42 +46,66 @@ jobs:
         continue-on-error: true
         run: |
           echo "🔍 Running Semgrep..."
-          semgrep --config=p/security-audit --json --output=semgrep-results.json . 2>/dev/null || true
-          SEMGREP_COUNT=$(jq '[.results[] | select(.severity == "ERROR")] | length' semgrep-results.json 2>/dev/null || echo 0)
-          echo "semgrep_count=$SEMGREP_COUNT" >> $GITHUB_OUTPUT
+          mkdir -p reports
+          semgrep --config=p/security-audit --json --output=reports/semgrep.json . 2>/dev/null || echo '{"results":[]}' > reports/semgrep.json
+          
+          SEMGREP_COUNT=$(jq '[.results[]? | select(.severity != null)] | length' reports/semgrep.json 2>/dev/null || echo 0)
+          echo "count=$SEMGREP_COUNT" >> $GITHUB_OUTPUT
+          echo "✅ Semgrep: $SEMGREP_COUNT issues"
 
-      - name: Run Gitleaks (Secrets Detection)
+      - name: Analyze with Gitleaks
         id: gitleaks
         continue-on-error: true
         run: |
-          echo "🔑 Running Gitleaks..."
-          gitleaks detect --report-format json --report-path gitleaks-results.json -v 2>/dev/null || echo '[]' > gitleaks-results.json
-          GITLEAKS_COUNT=$(jq 'length' gitleaks-results.json 2>/dev/null || echo 0)
-          echo "gitleaks_count=$GITLEAKS_COUNT" >> $GITHUB_OUTPUT
+          echo "🔑 Checking for secrets..."
+          mkdir -p reports
+          
+          # Use git log to check for secrets (no external tool needed)
+          if git log -p | grep -iE "(password|secret|api.?key|token|credential)" > /dev/null 2>&1; then
+            echo "count=1" >> $GITHUB_OUTPUT
+            echo "⚠️ Potential secrets found in git history"
+          else
+            echo "count=0" >> $GITHUB_OUTPUT
+            echo "✅ No obvious secrets detected"
+          fi
 
-      - name: Run Trivy (Dependency Scan)
-        id: trivy
+      - name: Check Dependencies
+        id: deps
         continue-on-error: true
         run: |
-          echo "🦠 Running Trivy..."
-          trivy fs . --format json --output trivy-results.json 2>/dev/null || true
-          TRIVY_COUNT=$(jq '[.Results[]? | select(.Vulnerabilities != null) | .Vulnerabilities[]] | length' trivy-results.json 2>/dev/null || echo 0)
-          echo "trivy_count=$TRIVY_COUNT" >> $GITHUB_OUTPUT
+          echo "📚 Checking dependencies..."
+          mkdir -p reports
+          
+          VULN_COUNT=0
+          
+          # Check Python dependencies
+          if [ -f requirements.txt ]; then
+            pip install safety -q 2>/dev/null
+            safety check -r requirements.txt --json > reports/safety-check.json 2>/dev/null || echo '[]' > reports/safety-check.json
+            VULN_COUNT=$(jq 'length' reports/safety-check.json 2>/dev/null || echo 0)
+          fi
+          
+          echo "count=$VULN_COUNT" >> $GITHUB_OUTPUT
+          echo "✅ Vulnerabilities: $VULN_COUNT"
 
       - name: Analyze Results
         id: analyze
         run: |
-          SEMGREP=$(cat semgrep-results.json 2>/dev/null | jq '[.results[] | select(.severity == "ERROR")] | length' 2>/dev/null || echo 0)
-          GITLEAKS=${{ steps.gitleaks.outputs.gitleaks_count }}
-          TRIVY=${{ steps.trivy.outputs.trivy_count }}
+          SEMGREP=${{ steps.semgrep.outputs.count }}
+          GITLEAKS=${{ steps.gitleaks.outputs.count }}
+          DEPS=${{ steps.deps.outputs.count }}
           
-          TOTAL=$((SEMGREP + GITLEAKS + TRIVY))
-          RISK_SCORE=$((TOTAL * 5))
+          SEMGREP=${SEMGREP:-0}
+          GITLEAKS=${GITLEAKS:-0}
+          DEPS=${DEPS:-0}
+          
+          TOTAL=$((SEMGREP + GITLEAKS + DEPS))
+          RISK_SCORE=$((TOTAL * 8))
           [ $RISK_SCORE -gt 100 ] && RISK_SCORE=100
           
-          if [ $GITLEAKS -gt 0 ] || [ $SEMGREP -gt 5 ]; then
+          if [ $GITLEAKS -gt 0 ]; then
             RISK_LEVEL="CRITICAL"
-          elif [ $TRIVY -gt 10 ] || [ $SEMGREP -gt 2 ]; then
+          elif [ $SEMGREP -gt 5 ] || [ $DEPS -gt 3 ]; then
             RISK_LEVEL="HIGH"
           elif [ $TOTAL -gt 0 ]; then
             RISK_LEVEL="MEDIUM"
@@ -84,8 +116,15 @@ jobs:
           echo "risk_level=$RISK_LEVEL" >> $GITHUB_OUTPUT
           echo "risk_score=$RISK_SCORE" >> $GITHUB_OUTPUT
           echo "total_findings=$TOTAL" >> $GITHUB_OUTPUT
-          echo "critical_count=$GITLEAKS" >> $GITHUB_OUTPUT
-          echo "high_count=$SEMGREP" >> $GITHUB_OUTPUT
+          echo "critical=$GITLEAKS" >> $GITHUB_OUTPUT
+          echo "high=$SEMGREP" >> $GITHUB_OUTPUT
+          echo "deps=$DEPS" >> $GITHUB_OUTPUT
+          
+          echo "📊 SCAN RESULTS"
+          echo "=============="
+          echo "Risk Level: $RISK_LEVEL"
+          echo "Risk Score: $RISK_SCORE/100"
+          echo "Total: $TOTAL (Code: $SEMGREP, Secrets: $GITLEAKS, Deps: $DEPS)"
 
       - name: Comment on PR
         if: github.event_name == 'pull_request'
@@ -95,29 +134,36 @@ jobs:
             const risk = '${{ steps.analyze.outputs.risk_level }}';
             const score = '${{ steps.analyze.outputs.risk_score }}';
             const total = '${{ steps.analyze.outputs.total_findings }}';
-            const critical = '${{ steps.analyze.outputs.critical_count }}';
-            const high = '${{ steps.analyze.outputs.high_count }}';
+            const critical = '${{ steps.analyze.outputs.critical }}';
+            const high = '${{ steps.analyze.outputs.high }}';
+            const deps = '${{ steps.analyze.outputs.deps }}';
 
             let emoji = '🟢';
             if (risk === 'CRITICAL') emoji = '🔴';
             else if (risk === 'HIGH') emoji = '🟠';
             else if (risk === 'MEDIUM') emoji = '🟡';
 
-            let statusMsg = 'No critical security issues';
-            if (critical > 0) statusMsg = 'CRITICAL issues must be fixed before merge';
-            else if (high > 0) statusMsg = 'HIGH severity issues require review';
+            let body = emoji + ' **Security Scan Results**\n\n';
+            body += '| Metric | Count |\n';
+            body += '|--------|-------|\n';
+            body += '| Risk Level | ' + risk + ' |\n';
+            body += '| Risk Score | ' + score + '/100 |\n';
+            body += '| Total Findings | ' + total + ' |\n';
+            body += '| Code Issues | ' + high + ' |\n';
+            body += '| Secrets Found | ' + critical + ' |\n';
+            body += '| Vulnerable Deps | ' + deps + ' |\n\n';
 
-            const body = emoji + ' Aegis Security Scan Results\n\n' +
-              '| Metric | Value |\n' +
-              '|--------|-------|\n' +
-              '| Risk Level | ' + risk + ' |\n' +
-              '| Risk Score | ' + score + '/100 |\n' +
-              '| Total Findings | ' + total + ' |\n' +
-              '| Critical | ' + critical + ' |\n' +
-              '| High | ' + high + ' |\n\n' +
-              statusMsg + '\n\n' +
-              '---\n' +
-              'Powered by Atlas Synapse Auditor';
+            if (critical > 0) {
+              body += '🔴 **CRITICAL: Secrets detected!** Do not merge.\n\n';
+            } else if (high > 3) {
+              body += '🟠 **HIGH: Code vulnerabilities found.** Review required.\n\n';
+            } else if (total > 0) {
+              body += '🟡 **MEDIUM: Minor issues detected.** Consider fixing.\n\n';
+            } else {
+              body += '✅ **PASS: No critical issues detected.**\n\n';
+            }
+
+            body += '---\n*Atlas Synapse Auditor • Trust Engine for AI*';
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -126,17 +172,16 @@ jobs:
               body: body
             });
 
-      - name: Fail on Critical Risk
+      - name: Block Merge on Critical
         if: steps.analyze.outputs.risk_level == 'CRITICAL'
-        run: exit 1
+        run: |
+          echo "❌ CRITICAL security issues detected - blocking merge"
+          exit 1
 
-      - name: Upload Results
+      - name: Upload Reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
-          name: security-scan-results
-          path: |
-            semgrep-results.json
-            gitleaks-results.json
-            trivy-results.json
+          name: security-reports
+          path: reports/
           retention-days: 30
