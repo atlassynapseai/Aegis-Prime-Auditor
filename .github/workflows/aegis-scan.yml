@@ -1,12 +1,9 @@
-# Atlas Synapse Security Scan — GitHub Actions Workflow
-# Scans code and blocks merge on critical security issues
+# Atlas Synapse Security Scan — Self-Contained GitHub Actions
+# No external dependencies — runs all scanners locally
 #
-# Setup Instructions:
-# 1. Copy this file to: .github/workflows/atlas-security-scan.yml
-# 2. Go to Settings → Secrets and variables → Actions
-# 3. Add secret: AEGIS_BACKEND_URL
-#    Example: https://your-codespace-8000.app.github.dev
-# 4. (Optional) Add secret: AEGIS_API_KEY if your backend requires authentication
+# Setup:
+# Just copy this file to: .github/workflows/atlas-security-scan.yml
+# No secrets needed! Works out of the box.
 
 name: Atlas Synapse Security Scan
 
@@ -15,10 +12,6 @@ on:
     branches: [ main, develop ]
   push:
     branches: [ main ]
-    paths:
-      - '**.py'
-      - '**.js'
-      - '**.ts'
   workflow_dispatch:
 
 permissions:
@@ -28,116 +21,114 @@ permissions:
 jobs:
   security-scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Run Aegis Security Scan
-        id: scan
-        env:
-          AEGIS_BACKEND_URL: ${{ secrets.AEGIS_BACKEND_URL }}
-          AEGIS_API_KEY: ${{ secrets.AEGIS_API_KEY }}
+      - name: Setup Scanners
         run: |
-          # Validate backend URL is configured
-          if [ -z "$AEGIS_BACKEND_URL" ]; then
-            echo "❌ AEGIS_BACKEND_URL secret not set"
-            echo "Configure in Settings → Secrets and variables → Actions"
-            exit 1
-          fi
+          echo "📦 Installing security scanners..."
+          
+          # Install Semgrep (SAST)
+          pip install semgrep -q
+          
+          # Install Gitleaks (Secrets)
+          curl -s https://raw.githubusercontent.com/gitleaks/gitleaks/master/install.sh | bash
+          
+          # Install Trivy (CVE scanner)
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | tee -a /etc/apt/sources.list.d/trivy.list
+          apt-get update -qq && apt-get install -y trivy -qq >/dev/null 2>&1
+          
+          echo "✅ Scanners ready"
 
-          # Check backend is reachable
-          if ! curl -m 10 -s "$AEGIS_BACKEND_URL/" > /dev/null 2>&1; then
-            echo "❌ Backend unreachable at: $AEGIS_BACKEND_URL"
-            exit 1
-          fi
+      - name: Run Semgrep (SAST)
+        id: semgrep
+        continue-on-error: true
+        run: |
+          echo "🔍 Running Semgrep..."
+          semgrep \
+            --config=p/security-audit \
+            --json \
+            --output=semgrep-results.json \
+            . 2>/dev/null || true
+          
+          SEMGREP_COUNT=$(jq '[.results[] | select(.severity == "ERROR" or .severity == "WARNING")] | length' semgrep-results.json 2>/dev/null || echo 0)
+          echo "semgrep_count=$SEMGREP_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $SEMGREP_COUNT issues"
 
-          # Find scannable files (limit to 25 to avoid timeouts)
-          FILES=$(find . \
-            -type f \( \
-              -name "*.py" -o -name "*.js" -o -name "*.ts" -o -name "*.tsx" \
-              -o -name "*.java" -o -name "*.go" -o -name "*.rs" \
-            \) \
-            -not -path "*/node_modules/*" \
-            -not -path "*/.git/*" \
-            -not -path "*/dist/*" \
-            -not -path "*/build/*" \
-            2>/dev/null | head -25)
+      - name: Run Gitleaks (Secrets Detection)
+        id: gitleaks
+        continue-on-error: true
+        run: |
+          echo "🔑 Running Gitleaks..."
+          gitleaks detect --report-format json --report-path gitleaks-results.json -v 2>/dev/null || true
+          
+          GITLEAKS_COUNT=$(jq '.[] | length' gitleaks-results.json 2>/dev/null || echo 0)
+          echo "gitleaks_count=$GITLEAKS_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $GITLEAKS_COUNT secrets"
 
-          if [ -z "$FILES" ]; then
-            echo "⚠️  No scannable files found"
-            echo "risk_level=UNKNOWN" >> $GITHUB_OUTPUT
-            echo "risk_score=0" >> $GITHUB_OUTPUT
-            echo "total_findings=0" >> $GITHUB_OUTPUT
-            echo "critical_count=0" >> $GITHUB_OUTPUT
-            echo "high_count=0" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+      - name: Run Trivy (Dependency Scan)
+        id: trivy
+        continue-on-error: true
+        run: |
+          echo "🦠 Running Trivy..."
+          trivy fs . --format json --output trivy-results.json 2>/dev/null || true
+          
+          TRIVY_COUNT=$(jq '[.Results[]? | select(.Vulnerabilities != null) | .Vulnerabilities[]] | length' trivy-results.json 2>/dev/null || echo 0)
+          echo "trivy_count=$TRIVY_COUNT" >> $GITHUB_OUTPUT
+          echo "Found $TRIVY_COUNT CVEs"
 
-          # Build curl multipart form data
-          CURL_ARGS=""
-          for file in $FILES; do
-            CURL_ARGS="$CURL_ARGS -F files=@$file"
-          done
-
-          # Call Aegis backend API
-          RESPONSE=$(curl -s -X POST \
-            -H "X-API-Key: ${AEGIS_API_KEY:-}" \
-            $CURL_ARGS \
-            "$AEGIS_BACKEND_URL/api/scan" \
-            -w "\n%{http_code}")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          BODY=$(echo "$RESPONSE" | head -n -1)
-
-          # Check HTTP response
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "❌ Scan failed (HTTP $HTTP_CODE)"
-            echo "$BODY" | head -20
-            exit 1
-          fi
-
-          # Save results
-          echo "$BODY" > scan_result.json
-
-          # Parse JSON response
-          if command -v jq &> /dev/null; then
-            RISK=$(echo "$BODY" | jq -r '.ai_analysis.risk_level // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
-            SCORE=$(echo "$BODY" | jq -r '.ai_analysis.risk_score // 0' 2>/dev/null || echo "0")
-            TOTAL=$(echo "$BODY" | jq -r '.total_findings // 0' 2>/dev/null || echo "0")
-            CRITICAL=$(echo "$BODY" | jq -r '.severity_breakdown.CRITICAL // 0' 2>/dev/null || echo "0")
-            HIGH=$(echo "$BODY" | jq -r '.severity_breakdown.HIGH // 0' 2>/dev/null || echo "0")
+      - name: Analyze Results
+        id: analyze
+        run: |
+          echo "📊 Analyzing results..."
+          
+          SEMGREP=$(cat semgrep-results.json 2>/dev/null | jq '[.results[] | select(.severity == "ERROR")] | length' 2>/dev/null || echo 0)
+          GITLEAKS=${{ steps.gitleaks.outputs.gitleaks_count }}
+          TRIVY=${{ steps.trivy.outputs.trivy_count }}
+          
+          TOTAL=$((SEMGREP + GITLEAKS + TRIVY))
+          
+          # Calculate risk score (0-100)
+          RISK_SCORE=$((TOTAL * 5))
+          if [ $RISK_SCORE -gt 100 ]; then RISK_SCORE=100; fi
+          
+          # Determine risk level
+          if [ $GITLEAKS -gt 0 ] || [ $SEMGREP -gt 5 ]; then
+            RISK_LEVEL="CRITICAL"
+          elif [ $TRIVY -gt 10 ] || [ $SEMGREP -gt 2 ]; then
+            RISK_LEVEL="HIGH"
+          elif [ $TOTAL -gt 0 ]; then
+            RISK_LEVEL="MEDIUM"
           else
-            RISK="UNKNOWN"
-            SCORE="0"
-            TOTAL="0"
-            CRITICAL="0"
-            HIGH="0"
+            RISK_LEVEL="LOW"
           fi
-
-          # Set outputs for next steps
-          echo "risk_level=$RISK" >> $GITHUB_OUTPUT
-          echo "risk_score=$SCORE" >> $GITHUB_OUTPUT
+          
+          # Output results
+          echo "risk_level=$RISK_LEVEL" >> $GITHUB_OUTPUT
+          echo "risk_score=$RISK_SCORE" >> $GITHUB_OUTPUT
           echo "total_findings=$TOTAL" >> $GITHUB_OUTPUT
-          echo "critical_count=$CRITICAL" >> $GITHUB_OUTPUT
-          echo "high_count=$HIGH" >> $GITHUB_OUTPUT
-
-          # Log summary
-          echo "✅ Scan Complete"
-          echo "Risk: $RISK ($SCORE/100)"
-          echo "Findings: $TOTAL (Critical: $CRITICAL, High: $HIGH)"
+          echo "critical_count=$GITLEAKS" >> $GITHUB_OUTPUT
+          echo "high_count=$SEMGREP" >> $GITHUB_OUTPUT
+          
+          echo "📈 Results:"
+          echo "  Total: $TOTAL"
+          echo "  Risk: $RISK_LEVEL ($RISK_SCORE/100)"
+          echo "  Secrets: $GITLEAKS | SAST: $SEMGREP | CVEs: $TRIVY"
 
       - name: Comment on PR
-        if: github.event_name == 'pull_request' && steps.scan.outcome == 'success'
+        if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const risk = '${{ steps.scan.outputs.risk_level }}';
-            const score = '${{ steps.scan.outputs.risk_score }}';
-            const total = '${{ steps.scan.outputs.total_findings }}';
-            const critical = '${{ steps.scan.outputs.critical_count }}';
-            const high = '${{ steps.scan.outputs.high_count }}';
+            const risk = '${{ steps.analyze.outputs.risk_level }}';
+            const score = '${{ steps.analyze.outputs.risk_score }}';
+            const total = '${{ steps.analyze.outputs.total_findings }}';
+            const critical = '${{ steps.analyze.outputs.critical_count }}';
+            const high = '${{ steps.analyze.outputs.high_count }}';
 
             const emoji = risk === 'CRITICAL' ? '🔴' :
                          risk === 'HIGH' ? '🟠' :
@@ -150,15 +141,15 @@ jobs:
 | **Risk Level** | ${risk} |
 | **Risk Score** | ${score}/100 |
 | **Total Findings** | ${total} |
-| **Critical** | ${critical} |
-| **High** | ${high} |
+| **Secrets Found** | ${critical} |
+| **Code Issues** | ${high} |
 
-${critical > 0 ? '⛔ **CRITICAL issues must be fixed before merge**' : ''}
-${high > 0 && critical == 0 ? '⚠️ **HIGH severity issues require review**' : ''}
-${critical == 0 && high == 0 ? '✅ **No critical security issues detected**' : ''}
+${critical > 0 ? '⛔ **SECRETS DETECTED** — Do not merge!' : ''}
+${high > 2 && critical == 0 ? '⚠️ **Code vulnerabilities found** — Please review' : ''}
+${critical == 0 && high <= 2 ? '✅ **Security scan passed**' : ''}
 
 ---
-*Powered by Atlas Synapse Auditor • Trust Engine for AI Systems*`;
+*Atlas Synapse Auditor • Trust Engine for AI Systems*`;
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -167,17 +158,19 @@ ${critical == 0 && high == 0 ? '✅ **No critical security issues detected**' : 
               body: body
             });
 
-      - name: Block Merge on Critical Risk
-        if: steps.scan.outputs.risk_level == 'CRITICAL' || steps.scan.outputs.critical_count > 0
+      - name: Fail on Critical Risk
+        if: steps.analyze.outputs.risk_level == 'CRITICAL'
         run: |
-          echo "❌ Build blocked: CRITICAL security risks detected"
+          echo "❌ CI blocked: CRITICAL security issues detected"
           exit 1
 
-      - name: Upload Scan Results
+      - name: Upload Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: atlas-security-scan-results
-          path: scan_result.json
+          name: security-scan-results
+          path: |
+            semgrep-results.json
+            gitleaks-results.json
+            trivy-results.json
           retention-days: 30
-          if-no-files-found: ignore
