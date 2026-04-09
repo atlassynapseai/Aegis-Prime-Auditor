@@ -14,7 +14,7 @@ from functools import wraps
 
 import jwt
 from fastapi import HTTPException, Depends, Request, status
-from fastapi.security import HTTPBearer, HTTPAuthCredentials
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 # Configuration
 JWT_SECRET = os.getenv("JWT_SECRET", "")
@@ -155,7 +155,7 @@ def validate_api_key(key_preview: str, key_hash: str, org_id: str, supabase_clie
 # DEPENDENCY INJECTION FOR FASTAPI
 # ============================================================================
 
-async def get_auth_context(request: Request, credentials: HTTPAuthCredentials = Depends(security)) -> AuthContext:
+async def get_auth_context(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)) -> AuthContext:
     """
     FastAPI dependency to extract and validate JWT from Authorization header
 
