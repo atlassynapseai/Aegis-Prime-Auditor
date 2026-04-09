@@ -193,7 +193,7 @@ export function IrisGlobalChatbot() {
             animate={{ opacity: 1, x: 0, y: 0 }}
             exit={{ opacity: 0, x: 20, y: 10 }}
             transition={{ duration: 0.5 }}
-            className="fixed bottom-24 right-6 z-30"
+            className="fixed bottom-40 right-6 z-30"
           >
             <motion.div
               animate={{ y: [0, -8, 0] }}
@@ -211,7 +211,7 @@ export function IrisGlobalChatbot() {
         onClick={() => setIsOpen(!isOpen)}
         whileHover={{ scale: 1.15 }}
         whileTap={{ scale: 0.9 }}
-        className="fixed bottom-6 right-6 z-40 flex items-center justify-center group"
+        className="fixed bottom-24 right-6 z-40 flex items-center justify-center group"
       >
         <motion.div
           animate={{ scale: [1, 1.2, 1] }}
@@ -275,7 +275,7 @@ export function IrisGlobalChatbot() {
             animate={{ opacity: 1, y: 0, scale: 1 }}
             exit={{ opacity: 0, y: 20, scale: 0.95 }}
             transition={{ type: 'spring', stiffness: 300, damping: 30 }}
-            className="fixed bottom-24 right-6 z-40 w-full max-w-sm bg-gradient-to-b from-slate-900 via-slate-900 to-slate-950 border border-cyan-500/30 rounded-3xl shadow-2xl shadow-cyan-500/20 flex flex-col overflow-hidden backdrop-blur-xl"
+            className="fixed bottom-40 right-6 z-40 w-full max-w-sm bg-gradient-to-b from-slate-900 via-slate-900 to-slate-950 border border-cyan-500/30 rounded-3xl shadow-2xl shadow-cyan-500/20 flex flex-col overflow-hidden backdrop-blur-xl"
           >
             <div className="px-6 py-5 bg-gradient-to-r from-cyan-500/20 via-purple-500/10 to-cyan-500/20 border-b border-cyan-500/20 flex items-center justify-between relative overflow-hidden">
               <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/5 to-transparent" />
