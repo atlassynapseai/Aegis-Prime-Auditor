@@ -53,7 +53,7 @@ function App() {
   const [isDragging, setIsDragging] = useState(false)
   const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' | 'warning' } | null>(null)
 
-  const BACKEND = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000'
+  const BACKEND = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
   const HOMEPAGE = 'https://atlassynapseai.com'
 
