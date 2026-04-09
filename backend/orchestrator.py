@@ -19,7 +19,7 @@ from typing import List, Dict, Any
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from openai import OpenAI
@@ -42,6 +42,7 @@ from specialized_scanners import SpecializedScanner
 from file_parsers import FileParser
 from sbom_compliance import SBOMGenerator, ComplianceMapper
 from pdf_generator import ReportGenerator
+from auth_middleware import AuthContext, get_auth_context_optional
 
 # Malware detection imports
 try:
@@ -208,7 +209,14 @@ class ImmutableAuditLog:
             return entry
 
     def _sync_to_supabase(self, entry: dict) -> bool:
-        """Sync audit log entry to Supabase (non-blocking, failures are logged but not fatal)."""
+        """
+        Sync audit log entry to Supabase immutable audit log (SOC 2 compliance).
+
+        ⚠️  NOTE: This writes to 'audit_logs' table (global, immutable, hash-chained).
+        This is SEPARATE from 'audit_log' table (multi-tenant, org-isolated) in dual_write_layer.
+
+        See Phase D docs for audit log consolidation logic.
+        """
         if not supabase_db:
             return False
 
@@ -528,10 +536,39 @@ Return JSON:
             ]
         }
 
+# Category to finding_type mapping for database compliance
+CATEGORY_TO_FINDING_TYPE = {
+    "SAST": "sast",
+    "Secrets": "secret",
+    "SCA": "sca",
+    "Deep Analysis": "sast",
+    "Configuration Security": "compliance",
+    "Infrastructure Security": "iac",
+    "Container Security": "iac",
+    "Web Security": "sast",
+    "Script Security": "sast",
+    "Malware Detection": "malware",
+    "Compliance": "compliance"
+}
+
+def get_finding_type(category: str) -> str:
+    """Map scanner category to database finding_type enum."""
+    return CATEGORY_TO_FINDING_TYPE.get(category, "sast")
+
+def enrich_findings(findings: List[Dict], org_id: str) -> List[Dict]:
+    """Add type and org_id to findings for database compliance."""
+    for finding in findings:
+        if "type" not in finding:
+            category = finding.get("category", "SAST")
+            finding["type"] = get_finding_type(category)
+        if "org_id" not in finding:
+            finding["org_id"] = org_id
+    return findings
+
 def generate_heatmap(findings):
     categories = ["SAST", "Secrets", "SCA", "Deep Analysis", "Malware Detection"]
     severities = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
-    matrix = {f"{c}_{s}": {"category": c, "severity": s, "count": 0, "risk_weight": 0.0} 
+    matrix = {f"{c}_{s}": {"category": c, "severity": s, "count": 0, "risk_weight": 0.0}
               for c in categories for s in severities}
     
     weights = {"CRITICAL": 1.0, "ERROR": 1.0, "HIGH": 0.75, "MEDIUM": 0.5, "WARNING": 0.5, "LOW": 0.25}
@@ -590,12 +627,19 @@ async def root():
     }
 
 @app.post("/api/scan")
-async def scan_code(files: List[UploadFile] = File(...)):
+async def scan_code(
+    files: List[UploadFile] = File(...),
+    auth: AuthContext = Depends(get_auth_context_optional),
+    background_tasks: BackgroundTasks = None
+):
     """Multi-file scan with code vulnerability + malware detection."""
     import zipfile
-    
+
     req_start = time.time()
     scan_id = str(uuid.uuid4())[:8]
+    # Use authenticated org_id or fallback to anonymous scan
+    org_id = auth.org_id if auth else "00000000-0000-0000-0000-000000000000"
+    user_id = auth.user_id if auth else None
     scan_dir = UPLOAD_DIR / scan_id
     scan_dir.mkdir(exist_ok=True)
     
@@ -708,9 +752,13 @@ async def scan_code(files: List[UploadFile] = File(...)):
             for r in results:
                 files_scanned.append({"file": r["file"], "findings": r["findings"]})
                 all_findings.extend(r["findings_list"])
-        
+
         # AI analysis
         file_desc = ", ".join(uploaded_filenames) if len(uploaded_filenames) <= 3 else f"{uploaded_filenames[0]} + {len(uploaded_filenames)-1} more"
+
+        # Enrich findings with type and org_id for database
+        all_findings = enrich_findings(all_findings, org_id)
+
         ai_analysis, ai_time = GeminiAnalyzer.analyze(all_findings, len(all_findings), file_desc)
         
         # Heatmap
@@ -744,24 +792,38 @@ async def scan_code(files: List[UploadFile] = File(...)):
             "malware_detection": malware_stats if malware_scanner else None,
             "performance": {"total": round(total_time, 2)},
             "status": "completed",
-            "engines": {"semgrep": {"findings": []}, "gitleaks": {"findings": []}, 
+            "org_id": org_id,
+            "created_by_user_id": user_id,
+            "engines": {"semgrep": {"findings": []}, "gitleaks": {"findings": []},
                        "trivy": {"findings": []}, "codeql": {"findings": []},
                        "malware": {"findings": []}}
         }
         
         SCAN_RESULTS_STORE[scan_id] = result
-        
-        # Persist to Supabase (user_id null until user claims after signup)
+
+        # Persist to Supabase with proper multi-tenancy and org_id
         if supabase_db:
             try:
-                supabase_db.table("scan_results").insert({
-                    "scan_id": scan_id,
-                    "user_id": None,
-                    "file_desc": file_desc,
-                    "total_findings": len(all_findings),
+                supabase_db.table("scans").insert({
+                    "id": scan_id,
+                    "org_id": org_id,
+                    "created_by_user_id": user_id,
+                    "status": "completed",
+                    "total_files": len(files_to_scan),
                     "risk_score": result["ai_analysis"].get("risk_score"),
                     "risk_level": result["ai_analysis"].get("risk_level"),
-                    "result_data": result,
+                    "malware_detected": malware_stats.get("total_detections", 0) > 0,
+                    "scan_started_at": datetime.now(timezone.utc).isoformat(),
+                    "scan_completed_at": datetime.now(timezone.utc).isoformat(),
+                    "duration_seconds": round(total_time, 2),
+                    "metadata": {
+                        "file_desc": file_desc,
+                        "uploaded_files": uploaded_filenames,
+                        "is_batch": len(files_to_scan) > 1,
+                        "severity_breakdown": sev_breakdown,
+                        "malware_stats": malware_stats,
+                        "result_data": result
+                    }
                 }).execute()
                 logger.info(f"✅ Scan {scan_id} saved to Supabase")
             except Exception as _e:

@@ -158,8 +158,15 @@ class DualWriteLayer:
 
     def log_audit_event(self, org_id: str, event_type: str, data: Dict) -> bool:
         """
-        Log to audit trail (Supabase only - never lossy)
-        Critical for SOC 2 compliance
+        Log to multi-tenant audit trail (Supabase 'audit_log' table).
+
+        ⚠️  NOTE: This is SEPARATE from global immutable 'audit_logs' table in orchestrator.py.
+
+        - 'audit_log' (singular, in 001_enterprise_schema.sql): Multi-tenant, org-isolated, HIPAA/GDPR compliant
+        - 'audit_logs' (plural, in supabase_audit_setup.sql): Global, immutable, hash-chained for SOC 2
+
+        This table is written to for org-specific audit trails.
+        Critical for SOC 2 compliance and GDPR retention policies.
         """
         if not self.supabase_enabled:
             logger.error("❌ Supabase disabled - audit log not persisted!")
