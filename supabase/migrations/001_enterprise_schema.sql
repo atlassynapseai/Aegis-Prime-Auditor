@@ -142,9 +142,6 @@ CREATE INDEX idx_scans_malware_detected ON public.scans(malware_detected);
 CREATE INDEX idx_scans_created_at ON public.scans(created_at DESC);
 CREATE INDEX idx_scans_expires_at ON public.scans(expires_at);
 
--- Partition by org_id for multi-tenancy performance
-PARTITION BY LIST (org_id) IF NOT EXISTS;
-
 -- ============================================================================
 -- 6. FINDINGS (Security Issues)
 -- ============================================================================
@@ -508,7 +505,7 @@ ALTER TABLE public.encryption_keys ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.data_retention_policies ENABLE ROW LEVEL SECURITY;
 
 -- Helper: Get user's org_id from JWT
-CREATE OR REPLACE FUNCTION auth.user_org_id() RETURNS UUID AS $$
+CREATE OR REPLACE FUNCTION public.user_org_id() RETURNS UUID AS $$
   SELECT (auth.jwt() ->> 'org_id')::UUID
 $$ LANGUAGE SQL STABLE;
 
@@ -517,7 +514,7 @@ $$ LANGUAGE SQL STABLE;
 -- =======================================================================
 CREATE POLICY org_isolation_on_organizations ON public.organizations
   FOR SELECT USING (
-    id = auth.user_org_id() OR
+    id = public.user_org_id() OR
     auth.role() = 'authenticated_admin'  -- Super admin bypass
   );
 
@@ -525,55 +522,55 @@ CREATE POLICY org_isolation_on_organizations ON public.organizations
 -- POLICY 2: Users - Org isolation
 -- =======================================================================
 CREATE POLICY users_org_isolation ON public.users
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 CREATE POLICY users_insert_same_org ON public.users
-  FOR INSERT WITH CHECK (org_id = auth.user_org_id());
+  FOR INSERT WITH CHECK (org_id = public.user_org_id());
 
 CREATE POLICY users_update_own_org ON public.users
-  FOR UPDATE USING (org_id = auth.user_org_id());
+  FOR UPDATE USING (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 3: API Keys - Org isolation
 -- =======================================================================
 CREATE POLICY api_keys_org_isolation ON public.api_keys
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 CREATE POLICY api_keys_insert_same_org ON public.api_keys
-  FOR INSERT WITH CHECK (org_id = auth.user_org_id());
+  FOR INSERT WITH CHECK (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 4: Projects - Org isolation
 -- =======================================================================
 CREATE POLICY projects_org_isolation ON public.projects
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 CREATE POLICY projects_insert_same_org ON public.projects
-  FOR INSERT WITH CHECK (org_id = auth.user_org_id());
+  FOR INSERT WITH CHECK (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 5: Scans - Org isolation (Multi-org view via shared tokens)
 -- =======================================================================
 CREATE POLICY scans_org_isolation ON public.scans
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 CREATE POLICY scans_insert_same_org ON public.scans
-  FOR INSERT WITH CHECK (org_id = auth.user_org_id());
+  FOR INSERT WITH CHECK (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 6: Findings - Org isolation
 -- =======================================================================
 CREATE POLICY findings_org_isolation ON public.findings
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 CREATE POLICY findings_insert_same_org ON public.findings
-  FOR INSERT WITH CHECK (org_id = auth.user_org_id());
+  FOR INSERT WITH CHECK (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 7: Audit Log - Org isolation + Read-only
 -- =======================================================================
 CREATE POLICY audit_log_org_isolation ON public.audit_log
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 -- Prevent direct INSERT (only backend can write)
 CREATE POLICY audit_log_insert_backend_only ON public.audit_log
@@ -583,25 +580,25 @@ CREATE POLICY audit_log_insert_backend_only ON public.audit_log
 -- POLICY 8: Compliance Frameworks - Org isolation
 -- =======================================================================
 CREATE POLICY compliance_frameworks_org_isolation ON public.compliance_frameworks
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 9: Fiduciary Scores - Org isolation
 -- =======================================================================
 CREATE POLICY fiduciary_scores_org_isolation ON public.fiduciary_scores
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 10: Logic Drift Events - Org isolation
 -- =======================================================================
 CREATE POLICY logic_drift_events_org_isolation ON public.logic_drift_events
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 11: Webhook Subscriptions - Org isolation
 -- =======================================================================
 CREATE POLICY webhook_subscriptions_org_isolation ON public.webhook_subscriptions
-  FOR SELECT USING (org_id = auth.user_org_id());
+  FOR SELECT USING (org_id = public.user_org_id());
 
 -- =======================================================================
 -- POLICY 12: Sessions - User can only see own sessions
@@ -609,7 +606,7 @@ CREATE POLICY webhook_subscriptions_org_isolation ON public.webhook_subscription
 CREATE POLICY sessions_user_isolation ON public.sessions
   FOR SELECT USING (
     user_id = auth.uid() OR
-    org_id = auth.user_org_id()  -- Admins see org sessions
+    org_id = public.user_org_id()  -- Admins see org sessions
   );
 
 -- ============================================================================
