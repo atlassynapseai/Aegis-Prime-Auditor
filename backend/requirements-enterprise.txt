@@ -4,7 +4,7 @@
 # FastAPI & Web
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-python-multipart==0.0.9
+python-multipart==0.0.26
 pydantic==2.5.0
 pydantic-settings==2.1.0
 
@@ -17,7 +17,7 @@ SQLAlchemy==2.0.23
 python-jose[cryptography]==3.5.0
 passlib[bcrypt]==1.7.4
 python-dotenv==1.0.0
-cryptography==43.0.0
+cryptography==46.0.7
 
 # CORS
 fastapi-cors==0.1.6

@@ -77,6 +77,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# DoS Protection Middleware for multipart/form-data
+@app.middleware("http")
+async def dos_protection_middleware(request, call_next):
+    """Protect against multipart DoS attacks by validating headers and size."""
+    # Check Content-Length header
+    if request.method == "POST" and "multipart/form-data" in request.headers.get("content-type", ""):
+        content_length = request.headers.get("content-length", "0")
+        try:
+            size_bytes = int(content_length)
+            max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+            if size_bytes > max_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": f"Request too large. Max: {MAX_UPLOAD_MB}MB"}
+                )
+        except (ValueError, TypeError):
+            pass  # Invalid header, let FastAPI handle it
+
+    response = await call_next(request)
+    return response
+
 # Config
 GEMINI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GEMINI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
